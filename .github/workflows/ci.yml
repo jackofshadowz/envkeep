@@ -8,8 +8,6 @@ on:
 jobs:
   smoke:
     runs-on: macos-latest
-    env:
-      XDG_CONFIG_HOME: ${{ runner.temp }}/cfg
     steps:
       - uses: actions/checkout@v4
 
@@ -22,9 +20,10 @@ jobs:
       - name: Smoke test (decrypt-on-demand mode)
         run: |
           set -euo pipefail
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/cfg"
           chmod +x envkeep
           ./envkeep --version
-          ./envkeep init --vault-dir "${{ runner.temp }}/vault"
+          ./envkeep init --vault-dir "$RUNNER_TEMP/vault"
 
           ./envkeep set my-app/TOKEN "hello-ci"
           test "$(./envkeep get my-app/TOKEN)" = "hello-ci"
@@ -34,13 +33,13 @@ jobs:
           ./envkeep env my-app | grep -q "export TOKEN="
           ./envkeep env my-app --dotenv | grep -q "TOKEN=hello-ci"
 
-          mkdir -p "${{ runner.temp }}/proj"
-          printf 'A=1\nexport B="two"\n# comment\n' > "${{ runner.temp }}/proj/.env"
-          ./envkeep import "${{ runner.temp }}/proj" --project imported --apply
+          mkdir -p "$RUNNER_TEMP/proj"
+          printf 'A=1\nexport B="two"\n# comment\n' > "$RUNNER_TEMP/proj/.env"
+          ./envkeep import "$RUNNER_TEMP/proj" --project imported --apply
           test "$(./envkeep get imported/A)" = "1"
           test "$(./envkeep get imported/B)" = "two"
 
           ./envkeep config
           ./envkeep lock
           ./envkeep log --tail 10
-          echo "✓ smoke test passed"
+          echo "smoke test passed"
