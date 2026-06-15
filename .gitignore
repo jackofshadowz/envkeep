@@ -1,0 +1,17 @@
+# Build artifacts
+*.app/
+__pycache__/
+*.pyc
+.DS_Store
+
+# SAFETY: never commit keys, vaults, or plaintext.
+# (These normally live OUTSIDE the repo — this is belt-and-suspenders.)
+identity.txt
+*.age
+recipients.txt
+.env
+.env.*
+*.plaintext
+
+# Local editor / agent config
+.claude/

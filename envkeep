@@ -1,0 +1,1334 @@
+#!/usr/bin/env python3
+"""
+envkeep — a small, secure ENV-secret manager for a small team.
+
+Architecture
+------------
+  * Source of truth : an age-encrypted `vault.age` living in a private git repo
+                      (or any synced folder), encrypted to every teammate's
+                      age public key listed in `recipients.txt`.
+  * Local cache     : the macOS Keychain. `envkeep sync` decrypts the vault
+                      into your login Keychain so reads are fast, local and
+                      OS-protected (Touch ID / login gated).
+  * CLI (this tool) : `envkeep get NAME` prints exactly one value — what a
+                      coding session / Claude Code uses.
+  * GUI             : `envkeep gui` opens a localhost web app for humans.
+
+No pip dependencies. Requires: `age`, `age-keygen` (brew install age) and the
+macOS `security` tool.
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import secrets as _stdlib_secrets
+import shlex
+import shutil
+from datetime import datetime
+import subprocess
+import sys
+import webbrowser
+from pathlib import Path
+
+# --------------------------------------------------------------------------- #
+# Paths & config
+# --------------------------------------------------------------------------- #
+
+APP = "envkeep"
+KEYCHAIN_SERVICE = "envkeep"               # macOS Keychain "service" namespace
+_CFG_BASE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+CONFIG_DIR = _CFG_BASE / APP
+# Backward compatibility: keep working for pre-rename ("env-secrets") installs.
+_LEGACY_DIR = _CFG_BASE / "env-secrets"
+if not CONFIG_DIR.exists() and _LEGACY_DIR.exists():
+    CONFIG_DIR = _LEGACY_DIR
+CONFIG_FILE = CONFIG_DIR / "config.json"
+IDENTITY_FILE = CONFIG_DIR / "identity.txt"   # YOUR age private key (chmod 600)
+ACCESS_LOG = CONFIG_DIR / "access.log"        # append-only audit trail (names, not values)
+
+
+def cache_enabled(cfg: dict) -> bool:
+    """Whether decrypted values are cached in the Keychain. Off = decrypt-on-demand."""
+    return cfg.get("cache", "none") == "keychain"
+
+
+def log_access(cfg: dict, action: str, name: str = "", source: str = "cli"):
+    """Append one audit line. Records the secret NAME and action — never the value."""
+    if not cfg.get("log", True):
+        return
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().astimezone().isoformat(timespec="seconds")
+        with ACCESS_LOG.open("a") as f:
+            f.write(f"{ts}\t{source}\t{action}\t{name}\n")
+        ACCESS_LOG.chmod(0o600)
+    except Exception:
+        pass
+
+
+def die(msg: str, code: int = 1):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg: str):
+    print(msg, file=sys.stderr)
+
+
+def need(tool: str):
+    if shutil.which(tool) is None:
+        die(f"`{tool}` not found on PATH. Install with: brew install age")
+
+
+def load_config() -> dict:
+    if not CONFIG_FILE.exists():
+        return {}
+    return json.loads(CONFIG_FILE.read_text())
+
+
+def save_config(cfg: dict):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+    CONFIG_FILE.chmod(0o600)
+
+
+def require_config() -> dict:
+    cfg = load_config()
+    if not cfg.get("vault_dir"):
+        die("not initialised. Run `envkeep init` first.")
+    return cfg
+
+
+def vault_dir(cfg: dict) -> Path:
+    return Path(cfg["vault_dir"]).expanduser()
+
+
+def vault_file(cfg: dict) -> Path:
+    return vault_dir(cfg) / "vault.age"
+
+
+def recipients_file(cfg: dict) -> Path:
+    return vault_dir(cfg) / "recipients.txt"
+
+
+# --------------------------------------------------------------------------- #
+# age encryption helpers
+# --------------------------------------------------------------------------- #
+
+def age_pubkey() -> str:
+    """Derive our public key from the identity file."""
+    need("age-keygen")
+    out = subprocess.run(
+        ["age-keygen", "-y", str(IDENTITY_FILE)],
+        capture_output=True, text=True,
+    )
+    if out.returncode != 0:
+        die(f"could not read public key from identity: {out.stderr.strip()}")
+    return out.stdout.strip()
+
+
+def read_recipients(cfg: dict) -> list[str]:
+    rf = recipients_file(cfg)
+    if not rf.exists():
+        return []
+    keys = []
+    for line in rf.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # allow "alias = age1..." or bare "age1..."
+        key = line.split("=")[-1].strip()
+        if key.startswith("age1"):
+            keys.append(key)
+    return keys
+
+
+def decrypt_vault(cfg: dict) -> dict:
+    """Return the decrypted vault as {"secrets": {NAME: VALUE}}."""
+    vf = vault_file(cfg)
+    if not vf.exists():
+        return {"secrets": {}}
+    need("age")
+    if not IDENTITY_FILE.exists():
+        die("no identity key found. Run `envkeep init`.")
+    out = subprocess.run(
+        ["age", "-d", "-i", str(IDENTITY_FILE), str(vf)],
+        capture_output=True,
+    )
+    if out.returncode != 0:
+        die("failed to decrypt vault. Are you a recipient? "
+            f"({out.stderr.decode().strip()})")
+    try:
+        data = json.loads(out.stdout.decode() or "{}")
+    except json.JSONDecodeError:
+        die("vault decrypted but is not valid JSON.")
+    data.setdefault("secrets", {})
+    return data
+
+
+def encrypt_vault(cfg: dict, data: dict):
+    """Encrypt `data` to every recipient and write vault.age atomically."""
+    need("age")
+    recips = read_recipients(cfg)
+    if not recips:
+        die("no recipients in recipients.txt — run `envkeep init` or "
+            "`envkeep add-member`.")
+    args = ["age", "-e"]
+    for r in recips:
+        args += ["-r", r]
+    vf = vault_file(cfg)
+    tmp = vf.with_suffix(".age.tmp")
+    args += ["-o", str(tmp)]
+    proc = subprocess.run(args, input=json.dumps(data, indent=2).encode(),
+                          capture_output=True)
+    if proc.returncode != 0:
+        die(f"encryption failed: {proc.stderr.decode().strip()}")
+    tmp.replace(vf)
+
+
+# --------------------------------------------------------------------------- #
+# macOS Keychain helpers (local cache)
+# --------------------------------------------------------------------------- #
+
+def kc_set(name: str, value: str):
+    subprocess.run(
+        ["security", "add-generic-password", "-U",
+         "-s", KEYCHAIN_SERVICE, "-a", name, "-w", value,
+         "-j", "Managed by `envkeep` CLI"],
+        capture_output=True,
+    )
+
+
+def kc_get(name: str) -> str | None:
+    out = subprocess.run(
+        ["security", "find-generic-password",
+         "-s", KEYCHAIN_SERVICE, "-a", name, "-w"],
+        capture_output=True, text=True,
+    )
+    if out.returncode != 0:
+        return None
+    return out.stdout.rstrip("\n")
+
+
+def kc_delete(name: str) -> bool:
+    out = subprocess.run(
+        ["security", "delete-generic-password",
+         "-s", KEYCHAIN_SERVICE, "-a", name],
+        capture_output=True,
+    )
+    return out.returncode == 0
+
+
+# --------------------------------------------------------------------------- #
+# git helpers (best effort)
+# --------------------------------------------------------------------------- #
+
+def git(cfg: dict, *args: str, check: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(vault_dir(cfg)), *args],
+                          capture_output=True, text=True,
+                          check=check)
+
+
+def is_git_repo(cfg: dict) -> bool:
+    return git(cfg, "rev-parse", "--is-inside-work-tree").returncode == 0
+
+
+def git_sync_pull(cfg: dict):
+    if cfg.get("auto_git") and is_git_repo(cfg):
+        r = git(cfg, "pull", "--ff-only")
+        if r.returncode != 0:
+            info(f"warning: git pull failed: {r.stderr.strip()}")
+
+
+def git_commit_push(cfg: dict, message: str):
+    if not (cfg.get("auto_git") and is_git_repo(cfg)):
+        return
+    git(cfg, "add", "vault.age", "recipients.txt")
+    r = git(cfg, "commit", "-m", message)
+    if r.returncode != 0 and "nothing to commit" not in (r.stdout + r.stderr):
+        info(f"warning: git commit failed: {r.stderr.strip()}")
+        return
+    push = git(cfg, "push")
+    if push.returncode != 0:
+        info(f"warning: git push failed (changes committed locally): "
+             f"{push.stderr.strip()}")
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+
+def cmd_init(args):
+    need("age")
+    need("age-keygen")
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 1. identity key
+    if not IDENTITY_FILE.exists():
+        info("Generating your personal age key…")
+        r = subprocess.run(["age-keygen", "-o", str(IDENTITY_FILE)],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"age-keygen failed: {r.stderr.strip()}")
+        IDENTITY_FILE.chmod(0o600)
+    pub = age_pubkey()
+
+    # 2. vault dir
+    default_dir = args.vault_dir or input(
+        "Path to the shared vault repo/folder "
+        "[~/env-secrets-vault]: ").strip() or "~/env-secrets-vault"
+    vdir = Path(default_dir).expanduser()
+    vdir.mkdir(parents=True, exist_ok=True)
+
+    cfg = load_config()
+    cfg["vault_dir"] = str(vdir)
+    cfg.setdefault("auto_git", True)
+    save_config(cfg)
+
+    # 3. recipients: make sure we're in the list
+    rf = recipients_file(cfg)
+    existing = read_recipients(cfg)
+    if pub not in existing:
+        alias = getpass.getuser()
+        with rf.open("a") as f:
+            if not rf.exists() or rf.stat().st_size == 0:
+                f.write("# age public keys of everyone who may read the vault\n")
+            f.write(f"{alias} = {pub}\n")
+        info(f"Added your key to {rf}")
+
+    # 4. create empty vault if missing
+    if not vault_file(cfg).exists():
+        encrypt_vault(cfg, {"secrets": {}})
+        info("Created empty vault.age")
+
+    # 5. .gitignore safety
+    gi = vdir / ".gitignore"
+    if not gi.exists():
+        gi.write_text("# never commit private keys or plaintext\n"
+                      "identity.txt\n*.tmp\n.env\n*.plaintext\n")
+
+    print()
+    print("✓ Initialised.")
+    print(f"  Your public key : {pub}")
+    print(f"  Identity (PRIVATE, never share): {IDENTITY_FILE}")
+    print(f"  Vault directory : {vdir}")
+    print()
+    print("Next:")
+    print("  • Share your PUBLIC key above with a teammate so they can add you,")
+    print("    or send teammates' keys to yourself and run `envkeep add-member`.")
+    print("  • `envkeep set NAME` to add a secret.")
+    print("  • `envkeep sync` on each machine to load secrets into the Keychain.")
+    print("  • Make the vault dir a private git repo for team sync (auto_git is on).")
+
+
+def cmd_sync(args):
+    cfg = require_config()
+    if not cache_enabled(cfg):
+        info("Cache is off (decrypt-on-demand mode) — nothing to sync.")
+        info("Enable the Keychain cache with:  envkeep config cache keychain")
+        return
+    git_sync_pull(cfg)
+    data = decrypt_vault(cfg)
+    n = 0
+    for name, value in data["secrets"].items():
+        kc_set(name, value)
+        n += 1
+    print(f"✓ Synced {n} secret(s) from the vault into your Keychain.")
+
+
+def cmd_get(args):
+    cfg = require_config()
+    if cache_enabled(cfg):
+        # Keychain first (fast); fall back to the vault and cache.
+        val = kc_get(args.name)
+        if val is None:
+            data = decrypt_vault(cfg)
+            val = data["secrets"].get(args.name)
+            if val is None:
+                die(f"no secret named '{args.name}'. Try `envkeep list`.")
+            kc_set(args.name, val)
+    else:
+        # Decrypt-on-demand: no plaintext is ever persisted to the Keychain.
+        data = decrypt_vault(cfg)
+        val = data["secrets"].get(args.name)
+        if val is None:
+            die(f"no secret named '{args.name}'. Try `envkeep list`.")
+    log_access(cfg, "get", args.name)
+    # raw value to stdout, no trailing decoration → safe for $(...) capture
+    sys.stdout.write(val)
+    if sys.stdout.isatty():
+        sys.stdout.write("\n")
+
+
+def cmd_lock(args):
+    """Purge every decrypted value from the Keychain (end-of-session / panic)."""
+    cfg = require_config()
+    data = decrypt_vault(cfg)
+    n = sum(1 for name in data["secrets"] if kc_delete(name))
+    log_access(cfg, "lock", f"{n} cached")
+    print(f"✓ Locked — purged {n} decrypted secret(s) from the Keychain.")
+
+
+def cmd_config(args):
+    """View or change settings: cache (keychain|none), log (on|off)."""
+    cfg = require_config()
+    if args.key is None:
+        print(f"cache     = {cfg.get('cache', 'none')}   (keychain | none)")
+        print(f"log       = {'on' if cfg.get('log', True) else 'off'}   (on | off)")
+        print(f"vault_dir = {cfg.get('vault_dir')}")
+        print(f"identity  = {IDENTITY_FILE}")
+        print(f"access log= {ACCESS_LOG}")
+        return
+    if args.key == "cache":
+        if args.value not in ("keychain", "none"):
+            die("usage: envkeep config cache keychain|none")
+        cfg["cache"] = args.value
+        save_config(cfg)
+        if args.value == "none":
+            try:
+                data = decrypt_vault(cfg)
+                purged = sum(1 for name in data["secrets"] if kc_delete(name))
+                info(f"Purged {purged} cached value(s) from the Keychain.")
+            except SystemExit:
+                pass
+        print(f"✓ cache = {args.value}")
+    elif args.key == "log":
+        if args.value not in ("on", "off"):
+            die("usage: envkeep config log on|off")
+        cfg["log"] = (args.value == "on")
+        save_config(cfg)
+        print(f"✓ log = {args.value}")
+
+
+def cmd_log(args):
+    """Show the access log (most recent last)."""
+    require_config()
+    if not ACCESS_LOG.exists():
+        info("(no access log yet)")
+        return
+    lines = ACCESS_LOG.read_text().splitlines()
+    if args.tail:
+        lines = lines[-args.tail:]
+    print("\n".join(lines))
+
+
+def cmd_list(args):
+    cfg = require_config()
+    data = decrypt_vault(cfg)
+    names = sorted(data["secrets"])
+    prefix = getattr(args, "prefix", None)
+    if prefix:
+        pfx = prefix.strip("/") + "/"
+        names = [n for n in names if n.startswith(pfx)]
+    if not names:
+        info("(no matching secrets)" if prefix else "(vault is empty)")
+        return
+    for n in names:
+        print(n)
+
+
+def cmd_folders(args):
+    """List the distinct folders/projects (the prefix before a secret's name)."""
+    cfg = require_config()
+    data = decrypt_vault(cfg)
+    folders = sorted({n.rsplit("/", 1)[0] for n in data["secrets"] if "/" in n})
+    if not folders:
+        info("(no folders yet — secrets are added as 'project/NAME')")
+        return
+    for f in folders:
+        print(f)
+
+
+def cmd_env(args):
+    """Print every secret in a folder as shell-ready env lines.
+
+    A coding session can load a whole project at once:
+        eval "$(envkeep env my-app)"      # export into the shell
+        envkeep env my-app --dotenv > .env
+    """
+    cfg = require_config()
+    data = decrypt_vault(cfg)
+    pfx = args.prefix.strip("/") + "/"
+    items = [(n[len(pfx):], v) for n, v in sorted(data["secrets"].items())
+             if n.startswith(pfx)]
+    if not items:
+        die(f"no secrets under '{args.prefix}'. Try `envkeep folders`.")
+    for key, val in items:
+        key = key.replace("/", "_")          # nested path → flat env var name
+        if args.dotenv:
+            print(f"{key}={val}")
+        else:
+            print(f"export {key}={shlex.quote(val)}")
+
+
+def cmd_set(args):
+    cfg = require_config()
+    git_sync_pull(cfg)
+    value = args.value
+    if value is None:
+        value = getpass.getpass(f"Value for {args.name}: ")
+    if value == "":
+        die("empty value — aborting.")
+    data = decrypt_vault(cfg)
+    existed = args.name in data["secrets"]
+    data["secrets"][args.name] = value
+    encrypt_vault(cfg, data)
+    if cache_enabled(cfg):
+        kc_set(args.name, value)
+    git_commit_push(cfg, f"{'update' if existed else 'add'} {args.name}")
+    log_access(cfg, "update" if existed else "add", args.name)
+    print(f"✓ {'Updated' if existed else 'Added'} {args.name}")
+
+
+def cmd_rm(args):
+    cfg = require_config()
+    git_sync_pull(cfg)
+    data = decrypt_vault(cfg)
+    if args.name not in data["secrets"]:
+        die(f"no secret named '{args.name}'.")
+    del data["secrets"][args.name]
+    encrypt_vault(cfg, data)
+    kc_delete(args.name)
+    git_commit_push(cfg, f"remove {args.name}")
+    log_access(cfg, "remove", args.name)
+    print(f"✓ Removed {args.name}")
+
+
+def cmd_members(args):
+    cfg = require_config()
+    rf = recipients_file(cfg)
+    if not rf.exists():
+        info("(no recipients yet)")
+        return
+    print(rf.read_text().rstrip())
+
+
+def cmd_add_member(args):
+    cfg = require_config()
+    git_sync_pull(cfg)
+    if not args.pubkey.startswith("age1"):
+        die("that doesn't look like an age public key (should start 'age1').")
+    rf = recipients_file(cfg)
+    if args.pubkey in read_recipients(cfg):
+        info("Already a recipient — nothing to do.")
+        return
+    with rf.open("a") as f:
+        f.write(f"{args.alias} = {args.pubkey}\n")
+    # re-encrypt so the new member can decrypt
+    data = decrypt_vault(cfg)
+    encrypt_vault(cfg, data)
+    git_commit_push(cfg, f"add member {args.alias}")
+    print(f"✓ Added {args.alias} and re-encrypted the vault for all members.")
+
+
+def cmd_pubkey(args):
+    print(age_pubkey())
+
+
+def cmd_gui(args):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    cfg = require_config()
+    token = _stdlib_secrets.token_urlsafe(24)
+    host, port = "127.0.0.1", args.port
+
+    def authed(handler) -> bool:
+        return handler.headers.get("X-Auth") == token or \
+            f"token={token}" in (handler.path.split("?", 1)[-1])
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):  # silence
+            pass
+
+        def _send(self, code, body, ctype="application/json"):
+            data = body if isinstance(body, bytes) else body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            if path == "/":
+                self._send(200, INDEX_HTML.replace("__TOKEN__", token),
+                           "text/html")
+                return
+            if not authed(self):
+                self._send(403, json.dumps({"error": "forbidden"}))
+                return
+            if path == "/api/list":
+                data = decrypt_vault(cfg)
+                self._send(200, json.dumps(
+                    {"secrets": sorted(data["secrets"]),
+                     "members": read_recipients(cfg)}))
+                return
+            if path == "/api/reveal":
+                from urllib.parse import parse_qs, urlparse
+                q = parse_qs(urlparse(self.path).query)
+                name = q.get("name", [""])[0]
+                data = decrypt_vault(cfg)
+                log_access(cfg, "reveal", name, "gui")
+                self._send(200, json.dumps(
+                    {"name": name, "value": data["secrets"].get(name)}))
+                return
+            self._send(404, json.dumps({"error": "not found"}))
+
+        def do_POST(self):
+            if not authed(self):
+                self._send(403, json.dumps({"error": "forbidden"}))
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            payload = json.loads(self.rfile.read(length) or "{}")
+            path = self.path.split("?", 1)[0]
+            try:
+                if path == "/api/set":
+                    name, value = payload["name"].strip(), payload["value"]
+                    if not name or value == "":
+                        raise ValueError("name and value required")
+                    git_sync_pull(cfg)
+                    data = decrypt_vault(cfg)
+                    existed = name in data["secrets"]
+                    data["secrets"][name] = value
+                    encrypt_vault(cfg, data)
+                    if cache_enabled(cfg):
+                        kc_set(name, value)
+                    git_commit_push(cfg, f"set {name} (gui)")
+                    log_access(cfg, "update" if existed else "add", name, "gui")
+                    self._send(200, json.dumps({"ok": True}))
+                    return
+                if path == "/api/delete":
+                    name = payload["name"]
+                    git_sync_pull(cfg)
+                    data = decrypt_vault(cfg)
+                    data["secrets"].pop(name, None)
+                    encrypt_vault(cfg, data)
+                    kc_delete(name)
+                    git_commit_push(cfg, f"delete {name} (gui)")
+                    log_access(cfg, "remove", name, "gui")
+                    self._send(200, json.dumps({"ok": True}))
+                    return
+                if path == "/api/lock":
+                    data = decrypt_vault(cfg)
+                    n = sum(1 for nm in data["secrets"] if kc_delete(nm))
+                    log_access(cfg, "lock", f"{n} cached", "gui")
+                    self._send(200, json.dumps({"ok": True, "count": n}))
+                    return
+                if path == "/api/sync":
+                    git_sync_pull(cfg)
+                    data = decrypt_vault(cfg)
+                    if cache_enabled(cfg):
+                        for n, v in data["secrets"].items():
+                            kc_set(n, v)
+                    self._send(200, json.dumps(
+                        {"ok": True, "count": len(data["secrets"])}))
+                    return
+                self._send(404, json.dumps({"error": "not found"}))
+            except Exception as e:  # noqa: BLE001 — surface to GUI
+                self._send(400, json.dumps({"error": str(e)}))
+
+    server = ThreadingHTTPServer((host, port), Handler)
+    url = f"http://{host}:{port}/?token={token}"
+    print(f"✓ Secrets GUI running at:\n  {url}\n(Press Ctrl-C to stop.)",
+          flush=True)
+    if not args.no_open:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+# --------------------------------------------------------------------------- #
+# GUI page
+# --------------------------------------------------------------------------- #
+
+INDEX_HTML = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Envkeep</title>
+<style>
+  :root{
+    --bg:#f7f7f6; --panel:#ffffff; --line:#ececeb; --line-2:#e2e2e0;
+    --ink:#101113; --muted:#6c7076; --muted-2:#9a9ea4;
+    --green:#7fee64; --green-deep:#16341d; --green-tint:#eefbe8; --green-line:#cdeebf;
+    --danger:#e5484d; --danger-tint:#fdeced;
+    --radius:11px; --radius-sm:8px;
+    --shadow-1:0 1px 2px rgba(16,17,19,.05);
+    --shadow-2:0 4px 12px rgba(16,17,19,.06), 0 24px 48px rgba(16,17,19,.10);
+    --mono:"SF Mono","JetBrains Mono",ui-monospace,Menlo,monospace;
+    --sans:-apple-system,"SF Pro Text",system-ui,"Segoe UI",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+       font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;
+       letter-spacing:-0.005em}
+  button{font-family:inherit}
+  ::selection{background:var(--green);color:var(--green-deep)}
+
+  .app{display:grid;grid-template-columns:252px 1fr;height:100vh}
+
+  /* ---------- sidebar ---------- */
+  .sidebar{background:var(--panel);border-right:1px solid var(--line);
+           display:flex;flex-direction:column;min-height:0}
+  .brand{display:flex;align-items:center;gap:10px;padding:18px 18px 14px}
+  .brand-mark{width:26px;height:26px;border-radius:7px;background:var(--green);
+       display:grid;place-items:center;color:var(--green-deep);font-size:14px;
+       box-shadow:inset 0 0 0 1px rgba(0,0,0,.04)}
+  .brand-name{font-weight:650;font-size:14.5px;letter-spacing:-0.02em}
+  .nav{flex:1;overflow-y:auto;padding:6px 10px}
+  .nav-label{font-size:11px;font-weight:600;letter-spacing:.06em;color:var(--muted-2);
+       text-transform:uppercase;padding:14px 8px 6px}
+  .nav-item{display:flex;align-items:center;gap:9px;width:100%;text-align:left;
+       border:none;background:none;cursor:pointer;color:var(--muted);
+       padding:7px 9px;border-radius:var(--radius-sm);font-size:13.5px;
+       font-weight:500;letter-spacing:-0.01em;transition:background .12s,color .12s}
+  .nav-item:hover{background:#f4f4f3;color:var(--ink)}
+  .nav-item.active{background:var(--green-tint);color:var(--ink);font-weight:600}
+  .nav-item .dot{width:6px;height:6px;border-radius:50%;background:var(--muted-2);flex:none}
+  .nav-item.active .dot{background:var(--green)}
+  .nav-item .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+       font-family:var(--mono);font-size:12.5px}
+  .nav-item .badge{font-size:11px;color:var(--muted-2);font-variant-numeric:tabular-nums}
+  .nav-item.active .badge{color:var(--green-deep)}
+  .sidebar-foot{border-top:1px solid var(--line);padding:12px;display:flex;
+       flex-direction:column;gap:8px}
+  .members{font-size:12px;color:var(--muted-2);padding:0 4px;display:flex;
+       align-items:center;gap:7px}
+
+  /* ---------- main ---------- */
+  .main{min-width:0;overflow-y:auto;display:flex;flex-direction:column}
+  .topbar{position:sticky;top:0;z-index:5;background:rgba(247,247,246,.85);
+       backdrop-filter:saturate(180%) blur(12px);
+       border-bottom:1px solid var(--line);
+       padding:16px 26px;display:flex;align-items:center;gap:16px}
+  .crumbs{display:flex;align-items:baseline;gap:10px;min-width:0}
+  .crumbs h1{margin:0;font-size:19px;font-weight:650;letter-spacing:-0.025em;
+       white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .crumbs .count{font-size:13px;color:var(--muted-2);font-variant-numeric:tabular-nums}
+  .topbar .sp{flex:1}
+  .search{position:relative}
+  .search svg{position:absolute;left:11px;top:50%;transform:translateY(-50%);
+       color:var(--muted-2);pointer-events:none}
+  .search input{width:230px;padding:8px 12px 8px 32px;border:1px solid var(--line-2);
+       background:var(--panel);border-radius:9px;font-size:13px;color:var(--ink);
+       outline:none;transition:border-color .12s,box-shadow .12s}
+  .search input::placeholder{color:var(--muted-2)}
+  .search input:focus{border-color:var(--green-line);
+       box-shadow:0 0 0 3px rgba(127,238,100,.25)}
+
+  .btn{display:inline-flex;align-items:center;gap:7px;border-radius:9px;
+       padding:8px 13px;font-size:13px;font-weight:550;cursor:pointer;
+       border:1px solid var(--line-2);background:var(--panel);color:var(--ink);
+       transition:background .12s,border-color .12s,transform .04s,box-shadow .12s;
+       white-space:nowrap}
+  .btn:hover{background:#fbfbfa;border-color:#d6d6d3}
+  .btn:active{transform:translateY(1px)}
+  .btn.primary{background:var(--green);border-color:transparent;color:var(--green-deep);
+       font-weight:650;box-shadow:var(--shadow-1)}
+  .btn.primary:hover{background:#74e657;filter:saturate(1.05)}
+  .btn.ghost{background:transparent;border-color:var(--line-2)}
+  .btn.danger{color:var(--danger);border-color:#f0c7c9}
+  .btn.danger:hover{background:var(--danger-tint);border-color:#e9b3b6}
+  .btn.block{width:100%;justify-content:center}
+  .btn.sm{padding:5px 9px;font-size:12px;border-radius:7px}
+
+  .folderbar{display:flex;align-items:center;gap:8px;padding:12px 26px;
+       border-bottom:1px solid var(--line);background:var(--panel)}
+  .folderbar .fb-name{font-family:var(--mono);font-size:12.5px;color:var(--muted);
+       background:var(--green-tint);border:1px solid var(--green-line);
+       padding:3px 9px;border-radius:20px}
+  .folderbar .sp{flex:1}
+
+  /* ---------- table ---------- */
+  .table-wrap{padding:8px 26px 40px}
+  table.tbl{width:100%;border-collapse:collapse;table-layout:fixed}
+  .tbl th:first-child,.tbl td:first-child{width:34%}
+  .tbl th:last-child,.tbl td:last-child{width:162px}
+  .tbl thead th{text-align:left;font-size:11px;font-weight:600;letter-spacing:.05em;
+       text-transform:uppercase;color:var(--muted-2);padding:14px 14px 10px;
+       border-bottom:1px solid var(--line)}
+  .tbl th.ta-r,.tbl td.ta-r{text-align:right}
+  .tbl tbody tr{border-bottom:1px solid var(--line);transition:background .1s}
+  .tbl tbody tr:hover{background:#fbfbfa}
+  .tbl td{padding:13px 14px;vertical-align:middle}
+  .key{font-family:var(--mono);font-size:13px;font-weight:600;color:var(--ink);
+       overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tag{display:inline-block;margin-top:4px;font-family:var(--mono);font-size:11px;
+       color:var(--muted);background:#f2f2f1;border:1px solid var(--line);
+       padding:1px 7px;border-radius:6px}
+  .val{display:flex;align-items:center;gap:8px;min-width:0}
+  .val code{font-family:var(--mono);font-size:12.5px;color:var(--muted);
+       flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .val.shown code{color:var(--ink)}
+  .iconbtn{display:grid;place-items:center;width:30px;height:30px;border-radius:8px;
+       border:1px solid transparent;background:none;cursor:pointer;color:var(--muted);
+       transition:background .12s,color .12s,border-color .12s}
+  .iconbtn:hover{background:#f1f1f0;color:var(--ink);border-color:var(--line)}
+  .iconbtn.danger:hover{background:var(--danger-tint);color:var(--danger);border-color:#f0c7c9}
+  .row-actions{display:inline-flex;gap:4px;justify-content:flex-end}
+  tbody tr{animation:rowin .3s ease both}
+  @keyframes rowin{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+  .empty{text-align:center;color:var(--muted-2);padding:70px 20px;font-size:14px}
+  .empty .big{font-size:15px;color:var(--muted);font-weight:550;margin-bottom:4px}
+
+  /* ---------- modal ---------- */
+  .overlay{position:fixed;inset:0;background:rgba(16,17,19,.32);
+       backdrop-filter:blur(3px);display:grid;place-items:center;z-index:50;
+       animation:fade .15s ease}
+  .overlay[hidden]{display:none}
+  @keyframes fade{from{opacity:0}to{opacity:1}}
+  .dialog{background:var(--panel);border:1px solid var(--line);border-radius:16px;
+       box-shadow:var(--shadow-2);width:440px;max-width:calc(100vw - 40px);
+       padding:22px 22px 18px;animation:pop .18s cubic-bezier(.2,.9,.3,1.2)}
+  .dialog.sm{width:380px}
+  @keyframes pop{from{opacity:0;transform:scale(.96) translateY(6px)}to{opacity:1;transform:none}}
+  .dialog h2{margin:0 0 16px;font-size:17px;font-weight:650;letter-spacing:-0.02em}
+  .dialog label{display:block;font-size:12px;font-weight:600;color:var(--muted);
+       margin:14px 0 6px;letter-spacing:-0.01em}
+  .dialog input,.dialog textarea{width:100%;border:1px solid var(--line-2);
+       background:#fcfcfb;border-radius:9px;padding:10px 12px;font-size:13px;
+       color:var(--ink);outline:none;font-family:var(--mono);
+       transition:border-color .12s,box-shadow .12s}
+  .dialog input:focus,.dialog textarea:focus{border-color:var(--green-line);
+       background:#fff;box-shadow:0 0 0 3px rgba(127,238,100,.25)}
+  .dialog textarea{resize:vertical;min-height:74px;line-height:1.5}
+  .dialog input:disabled{color:var(--muted);background:#f3f3f2;cursor:not-allowed;
+       box-shadow:none;border-color:var(--line)}
+  .dialog .hint{font-size:11.5px;color:var(--muted-2);margin:6px 2px 0;
+       font-family:var(--sans)}
+  .dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:20px}
+  .dialog p.muted{color:var(--muted);font-size:13px;margin:0}
+  .dialog p.muted b{color:var(--ink);font-family:var(--mono);font-weight:600}
+
+  /* ---------- toast ---------- */
+  .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(8px);
+       background:var(--ink);color:#fff;padding:10px 16px;border-radius:10px;
+       font-size:13px;font-weight:500;opacity:0;pointer-events:none;z-index:80;
+       box-shadow:var(--shadow-2);transition:opacity .18s,transform .18s;
+       display:flex;align-items:center;gap:9px;max-width:80vw}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  .toast .ok{color:var(--green)}
+  .toast code{font-family:var(--mono);font-size:12px;color:#dfe3df}
+
+  /* ---------- command palette ---------- */
+  .cmdk{align-items:flex-start;padding-top:12vh}
+  .cmdk .panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+       box-shadow:var(--shadow-2);width:580px;max-width:calc(100vw - 40px);overflow:hidden;
+       animation:pop .16s cubic-bezier(.2,.9,.3,1.2)}
+  .cmdk input{width:100%;border:none;border-bottom:1px solid var(--line);padding:16px 18px;
+       font-size:15px;font-family:var(--sans);outline:none;color:var(--ink);background:none;
+       letter-spacing:-0.01em}
+  .cmdk input::placeholder{color:var(--muted-2)}
+  .cmdk .results{max-height:54vh;overflow-y:auto;padding:7px}
+  .cmdk .opt{display:flex;align-items:center;gap:11px;padding:10px 12px;border-radius:9px;
+       cursor:pointer;color:var(--ink);font-size:13.5px}
+  .cmdk .opt .ic{width:26px;height:26px;border-radius:7px;background:#f2f2f1;display:grid;
+       place-items:center;color:var(--muted);flex:none;font-size:12px;font-weight:700;
+       font-family:var(--mono)}
+  .cmdk .opt .lbl{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .cmdk .opt .lbl b{font-weight:600}
+  .cmdk .opt .kind{font-size:10.5px;color:var(--muted-2);font-family:var(--mono);
+       text-transform:uppercase;letter-spacing:.05em}
+  .cmdk .opt.active{background:var(--green-tint)}
+  .cmdk .opt.active .ic{background:#fff;color:var(--green-deep)}
+  .cmdk .none{padding:26px;text-align:center;color:var(--muted-2);font-size:13px}
+  .kbd{display:inline-flex;align-items:center;gap:4px;cursor:pointer}
+  .kbd b{font:600 11px/1 var(--mono);background:#f1f1f0;border:1px solid var(--line-2);
+       border-bottom-width:2px;border-radius:5px;padding:4px 5px 3px;color:var(--muted)}
+  .kbd:hover b{background:#eaeae9;color:var(--ink)}
+</style></head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">&#9670;</div>
+      <div class="brand-name">Envkeep</div>
+    </div>
+    <nav class="nav" id="nav"></nav>
+    <div class="sidebar-foot">
+      <button class="btn ghost block" id="lockBtn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="11" width="18" height="11" rx="2"/>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        Lock (purge cache)</button>
+      <div class="members" id="memcount">&hellip;</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="crumbs">
+        <h1 id="viewTitle">All secrets</h1>
+        <span class="count" id="viewCount"></span>
+      </div>
+      <div class="sp"></div>
+      <div class="search">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+        <input id="search" placeholder="Search secrets" autocomplete="off">
+      </div>
+      <span class="kbd" id="cmdkBtn" title="Command palette"><b>&#8984;</b><b>K</b></span>
+      <button class="btn primary" id="newBtn">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+        New secret</button>
+    </header>
+
+    <div class="folderbar" id="folderbar" hidden>
+      <span class="fb-name" id="fbName"></span>
+      <span class="sp"></span>
+      <button class="btn sm" id="copyEnv">Copy <code>env</code> cmd</button>
+      <button class="btn sm" id="copyDotenv">Copy <code>.env</code> cmd</button>
+    </div>
+
+    <section class="table-wrap">
+      <table class="tbl">
+        <thead><tr><th>Name</th><th>Value</th><th class="ta-r">Actions</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div class="empty" id="empty" hidden></div>
+    </section>
+  </main>
+</div>
+
+<!-- new / edit secret -->
+<div class="overlay" id="modal" hidden>
+  <div class="dialog">
+    <h2 id="modalTitle">New secret</h2>
+    <label>Project / folder</label>
+    <input id="m_folder" list="folderlist" placeholder="my-app  (optional)" autocomplete="off">
+    <datalist id="folderlist"></datalist>
+    <label>Name</label>
+    <input id="m_name" placeholder="OPENAI_API_KEY" autocomplete="off">
+    <label>Value</label>
+    <textarea id="m_value" placeholder="sk-..." autocomplete="off" spellcheck="false"></textarea>
+    <div class="hint">Saving encrypts the vault for every member and (if it is a git repo)
+      commits &amp; pushes automatically.</div>
+    <div class="dialog-actions">
+      <button class="btn ghost" id="m_cancel">Cancel</button>
+      <button class="btn primary" id="m_save">Save secret</button>
+    </div>
+  </div>
+</div>
+
+<!-- confirm delete -->
+<div class="overlay" id="confirm" hidden>
+  <div class="dialog sm">
+    <h2>Delete secret?</h2>
+    <p class="muted" id="confirmText"></p>
+    <div class="dialog-actions">
+      <button class="btn ghost" id="c_cancel">Cancel</button>
+      <button class="btn danger" id="c_ok">Delete</button>
+    </div>
+  </div>
+</div>
+
+<!-- command palette -->
+<div class="overlay cmdk" id="palette" hidden>
+  <div class="panel">
+    <input id="pq" placeholder="Type a command, project, or secret..." autocomplete="off" spellcheck="false">
+    <div class="results" id="presults"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const TOKEN="__TOKEN__";
+const H={'X-Auth':TOKEN,'Content-Type':'application/json'};
+const $=s=>document.querySelector(s);
+
+const ICON={
+  eye:'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>',
+  eyeoff:'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.7 5.1A10.6 10.6 0 0 1 12 5c6.5 0 10 7 10 7a18 18 0 0 1-2.4 3.3M6.6 6.6A18 18 0 0 0 2 12s3.5 7 10 7a10.6 10.6 0 0 0 4.5-1M3 3l18 18"/></svg>',
+  copy:'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>',
+  term:'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/></svg>',
+  trash:'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>',
+  edit:'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
+};
+
+let SECRETS=[];        // full paths
+let MEMBERS=[];
+let current=null;      // selected folder, null = all
+let search="";
+const revealed={};     // full -> value (cached after reveal)
+
+async function api(path,opts={}){
+  opts.headers=H;
+  const r=await fetch(path,opts);
+  const j=await r.json();
+  if(!r.ok)throw new Error(j.error||'request failed');
+  return j;
+}
+function folderOf(full){const i=full.lastIndexOf('/');return i>=0?full.slice(0,i):'';}
+function keyOf(full){const i=full.lastIndexOf('/');return i>=0?full.slice(i+1):full;}
+
+function toast(msg,cmd){
+  const t=$('#toast');
+  t.innerHTML='<span class="ok">&check;</span>'+msg+(cmd?(' <code>'+cmd+'</code>'):'');
+  t.classList.add('show');
+  clearTimeout(toast._t);toast._t=setTimeout(()=>t.classList.remove('show'),2100);
+}
+async function writeClip(text,label,cmd){
+  if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.copyText){
+    window.webkit.messageHandlers.copyText.postMessage(text);return toast(label,cmd);}
+  let ok=false;
+  try{if(navigator.clipboard&&navigator.clipboard.writeText){
+    await navigator.clipboard.writeText(text);ok=true;}}catch(e){}
+  if(!ok){const ta=document.createElement('textarea');ta.value=text;
+    ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);
+    ta.focus();ta.select();try{ok=document.execCommand('copy');}catch(e){}
+    document.body.removeChild(ta);}
+  toast(ok?label:'Copy failed',cmd);
+}
+
+function el(tag,cls,txt){const e=document.createElement(tag);if(cls)e.className=cls;
+  if(txt!=null)e.textContent=txt;return e;}
+
+function folders(){
+  const m={};for(const f of SECRETS){const fo=folderOf(f);m[fo]=(m[fo]||0)+1;}
+  return m;
+}
+
+function renderNav(){
+  const nav=$('#nav');nav.innerHTML='';
+  const counts=folders();
+  const mk=(name,label,count,isAll)=>{
+    const b=el('button','nav-item'+((current===name)?' active':''));
+    b.appendChild(el('span','dot'));
+    const nm=el('span','nm',label);if(isAll)nm.style.fontFamily='var(--sans)';
+    b.appendChild(nm);
+    b.appendChild(el('span','badge',String(count)));
+    b.onclick=()=>{current=name;render();renderNav();};
+    return b;
+  };
+  nav.appendChild((()=>{const b=mk(null,'All secrets',SECRETS.length,true);
+    b.querySelector('.nm').style.fontWeight='600';return b;})());
+  const named=Object.keys(counts).filter(f=>f!=='').sort();
+  if(named.length){nav.appendChild(el('div','nav-label','Projects'));
+    for(const f of named)nav.appendChild(mk(f,f,counts[f]));}
+  if(counts['']!=null){nav.appendChild(el('div','nav-label','Other'));
+    nav.appendChild(mk('','ungrouped',counts['']));}
+}
+
+function render(){
+  // title + folderbar
+  $('#viewTitle').textContent=current==null?'All secrets':(current===''?'Ungrouped':current);
+  const fb=$('#folderbar');
+  if(current){fb.hidden=false;$('#fbName').textContent=current;
+    $('#copyEnv').onclick=()=>writeClip('envkeep env '+current,'Copied command','envkeep env '+current);
+    $('#copyDotenv').onclick=()=>writeClip('envkeep env '+current+' --dotenv','Copied command','envkeep env '+current+' --dotenv');
+  } else fb.hidden=true;
+
+  let rows=SECRETS.slice();
+  if(current!=null)rows=rows.filter(f=>folderOf(f)===current);
+  if(search)rows=rows.filter(f=>f.toLowerCase().includes(search));
+  rows.sort();
+  $('#viewCount').textContent=rows.length?(rows.length+(rows.length===1?' secret':' secrets')):'';
+
+  const tb=$('#rows');tb.innerHTML='';
+  const empty=$('#empty');
+  if(!rows.length){empty.hidden=false;
+    empty.innerHTML=SECRETS.length
+      ?'<div class="big">No matches</div>Try a different search or project.'
+      :'<div class="big">No secrets yet</div>Click <b>New secret</b> to add your first one.';
+    return;}
+  empty.hidden=true;
+
+  rows.forEach((full,i)=>{
+    const tr=el('tr');tr.style.animationDelay=(i*22)+'ms';
+
+    const tdName=el('td');
+    tdName.appendChild(el('div','key',keyOf(full)));
+    if(current==null&&folderOf(full))tdName.appendChild(el('span','tag',folderOf(full)));
+    tr.appendChild(tdName);
+
+    const tdVal=el('td');
+    const wrap=el('div','val');
+    const code=el('code');
+    const eye=el('button','iconbtn');eye.title='Reveal / hide';
+    const paint=()=>{                       // update this row only — no full re-render
+      const shown=revealed[full]!=null;
+      wrap.classList.toggle('shown',shown);
+      code.textContent=shown?revealed[full]:'••••••••••••';
+      eye.innerHTML=shown?ICON.eyeoff:ICON.eye;
+    };
+    paint();
+    eye.onclick=async()=>{
+      if(revealed[full]!=null){delete revealed[full];paint();return;}
+      try{const j=await api('/api/reveal?name='+encodeURIComponent(full));
+        revealed[full]=j.value;paint();}catch(e){toast(e.message);}
+    };
+    wrap.appendChild(eye);wrap.appendChild(code);
+    tdVal.appendChild(wrap);
+    tr.appendChild(tdVal);
+
+    const tdAct=el('td','ta-r');
+    const acts=el('div','row-actions');
+    const bCmd=el('button','iconbtn');bCmd.title='Copy command (envkeep get '+full+')';
+    bCmd.innerHTML=ICON.term;
+    bCmd.onclick=()=>writeClip('envkeep get '+full,'Copied command','envkeep get '+full);
+    const bCopy=el('button','iconbtn');bCopy.title='Copy value';bCopy.innerHTML=ICON.copy;
+    bCopy.onclick=async()=>{try{const j=await api('/api/reveal?name='+encodeURIComponent(full));
+      writeClip(j.value,'Copied value of '+keyOf(full));}catch(e){toast(e.message);}};
+    const bEdit=el('button','iconbtn');bEdit.title='Edit value';bEdit.innerHTML=ICON.edit;
+    bEdit.onclick=()=>openModal(full);
+    const bDel=el('button','iconbtn danger');bDel.title='Delete';bDel.innerHTML=ICON.trash;
+    bDel.onclick=()=>askDelete(full);
+    acts.appendChild(bCmd);acts.appendChild(bCopy);acts.appendChild(bEdit);acts.appendChild(bDel);
+    tdAct.appendChild(acts);
+    tr.appendChild(tdAct);
+
+    tb.appendChild(tr);
+  });
+}
+
+// ---- modal (new + edit) ----
+let editing=null;   // full path when editing an existing secret, else null
+async function openModal(edit){
+  editing=edit||null;
+  const dl=$('#folderlist');dl.innerHTML='';
+  Object.keys(folders()).filter(f=>f!=='').sort().forEach(f=>{
+    const o=document.createElement('option');o.value=f;dl.appendChild(o);});
+  const fF=$('#m_folder'),fN=$('#m_name'),fV=$('#m_value');
+  if(editing){
+    $('#modalTitle').textContent='Edit secret';
+    $('#m_save').textContent='Update secret';
+    fF.value=folderOf(editing);fN.value=keyOf(editing);
+    fF.disabled=true;fN.disabled=true;            // identity locked while editing
+    fV.value='';fV.placeholder='Enter a new value...';
+    $('#modal').hidden=false;
+    try{const j=await api('/api/reveal?name='+encodeURIComponent(editing));fV.value=j.value;}catch(e){}
+    setTimeout(()=>fV.focus(),30);
+  } else {
+    $('#modalTitle').textContent='New secret';
+    $('#m_save').textContent='Save secret';
+    fF.disabled=false;fN.disabled=false;
+    fF.value=(current&&current!=='')?current:'';fN.value='';fV.value='';fV.placeholder='sk-...';
+    $('#modal').hidden=false;setTimeout(()=>fN.focus(),30);
+  }
+}
+function closeModal(){$('#modal').hidden=true;editing=null;
+  $('#m_folder').disabled=false;$('#m_name').disabled=false;}
+async function saveModal(){
+  const f=$('#m_folder').value.trim().replace(/^\/+|\/+$/g,'');
+  const n=$('#m_name').value.trim();
+  const v=$('#m_value').value;
+  if(!n||v===''){toast('Name and value are required');return;}
+  const full=editing?editing:(f?f+'/'+n:n);
+  try{await api('/api/set',{method:'POST',body:JSON.stringify({name:full,value:v})});
+    const wasEditing=!!editing;closeModal();
+    delete revealed[full];
+    toast((wasEditing?'Updated ':'Saved ')+keyOf(full));await load();
+    if(!wasEditing&&f){current=f;render();renderNav();}
+  }catch(e){toast(e.message);}
+}
+
+// ---- confirm ----
+let pendingDelete=null;
+function askDelete(full){pendingDelete=full;
+  $('#confirmText').innerHTML='This removes <b>'+full+'</b> for everyone with vault access. '
+    +'Rotate it afterwards if it was ever shared.';
+  $('#confirm').hidden=false;}
+function closeConfirm(){$('#confirm').hidden=true;pendingDelete=null;}
+async function doDelete(){
+  const full=pendingDelete;closeConfirm();if(!full)return;
+  try{await api('/api/delete',{method:'POST',body:JSON.stringify({name:full})});
+    delete revealed[full];toast('Deleted '+keyOf(full));await load();}catch(e){toast(e.message);}
+}
+
+async function sync(){
+  try{const j=await api('/api/sync',{method:'POST',body:'{}'});
+    toast('Synced '+j.count+' secret'+(j.count===1?'':'s')+' to Keychain');}catch(e){toast(e.message);}
+}
+async function lock(){
+  try{const j=await api('/api/lock',{method:'POST',body:'{}'});
+    for(const k in revealed)delete revealed[k];render();
+    toast('Locked — purged '+j.count+' cached secret'+(j.count===1?'':'s'));}catch(e){toast(e.message);}
+}
+
+async function load(){
+  const j=await api('/api/list');
+  SECRETS=j.secrets;MEMBERS=j.members;
+  $('#memcount').innerHTML='<svg width="13" height="13" viewBox="0 0 24 24" fill="none" '
+    +'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    +'<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>'
+    +'<path d="M22 21v-2a4 4 0 0 0-3-3.87"/></svg>'
+    +MEMBERS.length+' member'+(MEMBERS.length===1?'':'s')+' with access';
+  if(current!=null&&current!==''&&!Object.keys(folders()).includes(current))current=null;
+  renderNav();render();
+}
+
+// ---- command palette ----
+let PALF=[],palIdx=0;
+function buildCommands(){
+  const c=[];
+  c.push({k:'action',ic:'+',label:'New secret',run:openModal});
+  c.push({k:'action',ic:'L',label:'Lock — purge cached secrets',run:lock});
+  c.push({k:'action',ic:'S',label:'Sync to Keychain',run:sync});
+  c.push({k:'go',ic:'#',label:'Go to: All secrets',run:()=>{current=null;render();renderNav();}});
+  Object.keys(folders()).filter(f=>f).sort().forEach(f=>
+    c.push({k:'project',ic:'/',label:'Go to project: '+f,run:()=>{current=f;render();renderNav();}}));
+  Object.keys(folders()).filter(f=>f).sort().forEach(f=>
+    c.push({k:'env',ic:'$',label:'Copy env cmd: '+f,sub:'envkeep env '+f,
+      run:()=>writeClip('envkeep env '+f,'Copied command','envkeep env '+f)}));
+  SECRETS.slice().sort().forEach(full=>{
+    c.push({k:'cmd',ic:'>',label:'Copy command: '+full,sub:'envkeep get '+full,
+      run:()=>writeClip('envkeep get '+full,'Copied command','envkeep get '+full)});
+    c.push({k:'value',ic:'*',label:'Copy value: '+full,
+      run:async()=>{try{const j=await api('/api/reveal?name='+encodeURIComponent(full));
+        writeClip(j.value,'Copied value of '+keyOf(full));}catch(e){toast(e.message);}}});
+  });
+  return c;
+}
+function openPalette(){PALL=buildCommands();palIdx=0;$('#palette').hidden=false;
+  $('#pq').value='';renderPalette('');setTimeout(()=>$('#pq').focus(),20);}
+function closePalette(){$('#palette').hidden=true;}
+let PALL=[];
+function renderPalette(q){
+  q=q.toLowerCase().trim();
+  PALF=q?PALL.filter(c=>c.label.toLowerCase().includes(q)||(c.sub&&c.sub.toLowerCase().includes(q))):PALL;
+  PALF=PALF.slice(0,50);
+  if(palIdx>=PALF.length)palIdx=Math.max(0,PALF.length-1);
+  const box=$('#presults');box.innerHTML='';
+  if(!PALF.length){box.innerHTML='<div class="none">No matching commands</div>';return;}
+  PALF.forEach((c,i)=>{
+    const o=el('div','opt'+(i===palIdx?' active':''));
+    o.appendChild(el('span','ic',c.ic));
+    const lbl=el('span','lbl',c.label);o.appendChild(lbl);
+    o.appendChild(el('span','kind',c.k));
+    o.onmousemove=()=>{if(palIdx!==i){palIdx=i;highlight();}};
+    o.onclick=()=>{closePalette();c.run();};
+    box.appendChild(o);
+  });
+}
+function highlight(){const box=$('#presults');
+  [...box.children].forEach((ch,i)=>ch.classList.toggle('active',i===palIdx));
+  const a=box.children[palIdx];if(a&&a.scrollIntoView)a.scrollIntoView({block:'nearest'});}
+
+// wire up
+$('#newBtn').onclick=openModal;
+$('#m_cancel').onclick=closeModal;
+$('#m_save').onclick=saveModal;
+$('#c_cancel').onclick=closeConfirm;
+$('#c_ok').onclick=doDelete;
+$('#lockBtn').onclick=lock;
+$('#cmdkBtn').onclick=openPalette;
+$('#search').addEventListener('input',e=>{search=e.target.value.toLowerCase().trim();render();});
+$('#modal').addEventListener('click',e=>{if(e.target.id==='modal')closeModal();});
+$('#confirm').addEventListener('click',e=>{if(e.target.id==='confirm')closeConfirm();});
+$('#palette').addEventListener('click',e=>{if(e.target.id==='palette')closePalette();});
+$('#m_value').addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.metaKey||e.ctrlKey))saveModal();});
+$('#pq').addEventListener('input',e=>{palIdx=0;renderPalette(e.target.value);});
+$('#pq').addEventListener('keydown',e=>{
+  if(e.key==='ArrowDown'){e.preventDefault();palIdx=Math.min(PALF.length-1,palIdx+1);highlight();}
+  else if(e.key==='ArrowUp'){e.preventDefault();palIdx=Math.max(0,palIdx-1);highlight();}
+  else if(e.key==='Enter'){e.preventDefault();const c=PALF[palIdx];if(c){closePalette();c.run();}}
+});
+function typing(){return /(INPUT|TEXTAREA)/.test(document.activeElement.tagName);}
+document.addEventListener('keydown',e=>{
+  if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){
+    e.preventDefault();$('#palette').hidden?openPalette():closePalette();return;}
+  if(e.key==='Escape'){closeModal();closeConfirm();closePalette();return;}
+  if(typing())return;
+  if(e.key==='n'){e.preventDefault();openModal();}
+  else if(e.key==='/'){e.preventDefault();$('#search').focus();}
+  else if(e.key==='l'){lock();}
+});
+load();
+</script>
+</body></html>
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Arg parsing
+# --------------------------------------------------------------------------- #
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="envkeep",
+        description="Secure ENV-secret manager (age vault + macOS Keychain).")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("init", help="set up your key, vault and recipients")
+    s.add_argument("--vault-dir", help="path to the shared vault repo/folder")
+    s.set_defaults(func=cmd_init)
+
+    s = sub.add_parser("sync", help="decrypt the vault into your Keychain (cache mode)")
+    s.set_defaults(func=cmd_sync)
+
+    s = sub.add_parser("get", help="print one secret's value")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_get)
+
+    s = sub.add_parser("lock", help="purge decrypted secrets from the Keychain")
+    s.set_defaults(func=cmd_lock)
+
+    s = sub.add_parser("config", help="view/change settings (cache, log)")
+    s.add_argument("key", nargs="?", choices=["cache", "log"])
+    s.add_argument("value", nargs="?")
+    s.set_defaults(func=cmd_config)
+
+    s = sub.add_parser("log", help="show the access log")
+    s.add_argument("--tail", type=int, default=0, help="show only the last N lines")
+    s.set_defaults(func=cmd_log)
+
+    s = sub.add_parser("list", help="list secret names (no values)")
+    s.add_argument("prefix", nargs="?", help="only names under this folder/project")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("folders", help="list folders/projects")
+    s.set_defaults(func=cmd_folders)
+
+    s = sub.add_parser("env", help="print a whole folder as export/.env lines")
+    s.add_argument("prefix", help="folder/project name")
+    s.add_argument("--dotenv", action="store_true",
+                   help="KEY=VALUE lines (no 'export '), for writing a .env file")
+    s.set_defaults(func=cmd_env)
+
+    s = sub.add_parser("set", help="add/update a secret")
+    s.add_argument("name")
+    s.add_argument("value", nargs="?", help="omit to be prompted (hidden)")
+    s.set_defaults(func=cmd_set)
+
+    s = sub.add_parser("rm", help="remove a secret")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_rm)
+
+    s = sub.add_parser("members", help="show who can read the vault")
+    s.set_defaults(func=cmd_members)
+
+    s = sub.add_parser("add-member", help="add a teammate's public key")
+    s.add_argument("alias")
+    s.add_argument("pubkey")
+    s.set_defaults(func=cmd_add_member)
+
+    s = sub.add_parser("pubkey", help="print your age public key")
+    s.set_defaults(func=cmd_pubkey)
+
+    s = sub.add_parser("gui", help="open the localhost web GUI")
+    s.add_argument("--port", type=int, default=8782)
+    s.add_argument("--no-open", action="store_true",
+                   help="don't auto-open the browser")
+    s.set_defaults(func=cmd_gui)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
