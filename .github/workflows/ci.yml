@@ -1,51 +1,46 @@
-  name: CI
+name: CI
 
-  on:
-    push:
-      branches: [main]
-    pull_request:
+on:
+  push:
+    branches: [main]
+  pull_request:
 
-  jobs:
-    smoke:
-      runs-on: macos-latest
-      env:
-        XDG_CONFIG_HOME: ${{ runner.temp }}/cfg
-      steps:
-        - uses: actions/checkout@v4
+jobs:
+  smoke:
+    runs-on: macos-latest
+    env:
+      XDG_CONFIG_HOME: ${{ runner.temp }}/cfg
+    steps:
+      - uses: actions/checkout@v4
 
-        - name: Install age
-          run: brew install age
+      - name: Install age
+        run: brew install age
 
-        - name: Syntax check
-          run: python3 -c "import ast;
-  ast.parse(open('envkeep').read()); print('ok')"
+      - name: Syntax check
+        run: python3 -c "import ast; ast.parse(open('envkeep').read()); print('ok')"
 
-        - name: Smoke test (decrypt-on-demand mode)
-          run: |
-            set -euo pipefail
-            chmod +x envkeep
-            ./envkeep --version
-            ./envkeep init --vault-dir "${{ runner.temp
-  }}/vault"
+      - name: Smoke test (decrypt-on-demand mode)
+        run: |
+          set -euo pipefail
+          chmod +x envkeep
+          ./envkeep --version
+          ./envkeep init --vault-dir "${{ runner.temp }}/vault"
 
-            ./envkeep set my-app/TOKEN "hello-ci"
-            test "$(./envkeep get my-app/TOKEN)" = "hello-ci"
+          ./envkeep set my-app/TOKEN "hello-ci"
+          test "$(./envkeep get my-app/TOKEN)" = "hello-ci"
 
-            ./envkeep list | grep -q "my-app/TOKEN"
-            ./envkeep folders | grep -q "my-app"
-            ./envkeep env my-app | grep -q "export TOKEN="
-            ./envkeep env my-app --dotenv | grep -q
-  "TOKEN=hello-ci"
+          ./envkeep list | grep -q "my-app/TOKEN"
+          ./envkeep folders | grep -q "my-app"
+          ./envkeep env my-app | grep -q "export TOKEN="
+          ./envkeep env my-app --dotenv | grep -q "TOKEN=hello-ci"
 
-            mkdir -p "${{ runner.temp }}/proj"
-            printf 'A=1\nexport B="two"\n# comment\n' > "${{
-  runner.temp }}/proj/.env"
-            ./envkeep import "${{ runner.temp }}/proj"
-  --project imported --apply
-            test "$(./envkeep get imported/A)" = "1"
-            test "$(./envkeep get imported/B)" = "two"
+          mkdir -p "${{ runner.temp }}/proj"
+          printf 'A=1\nexport B="two"\n# comment\n' > "${{ runner.temp }}/proj/.env"
+          ./envkeep import "${{ runner.temp }}/proj" --project imported --apply
+          test "$(./envkeep get imported/A)" = "1"
+          test "$(./envkeep get imported/B)" = "two"
 
-            ./envkeep config
-            ./envkeep lock
-            ./envkeep log --tail 10
-            echo "✓ smoke test passed"
+          ./envkeep config
+          ./envkeep lock
+          ./envkeep log --tail 10
+          echo "✓ smoke test passed"
