@@ -10,12 +10,23 @@ import Cocoa
 import WebKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScriptMessageHandler {
-    // JS calls window.webkit.messageHandlers.copyText.postMessage(value).
+    // JS copies via window.webkit.messageHandlers.{copyText,copySecret}.postMessage(value).
+    // copySecret additionally wipes the pasteboard ~45s later (if still unchanged).
     func userContentController(_ controller: WKUserContentController,
                               didReceive message: WKScriptMessage) {
-        guard message.name == "copyText", let text = message.body as? String else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
+        guard let text = message.body as? String else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        if message.name == "copySecret" {
+            let stamp = pb.changeCount
+            DispatchQueue.main.asyncAfter(deadline: .now() + 45) {
+                // Only clear if the user hasn't copied something else since.
+                if pb.changeCount == stamp, pb.string(forType: .string) == text {
+                    pb.clearContents()
+                }
+            }
+        }
     }
 
     var window: NSWindow!
@@ -40,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         // Native bridge so the web GUI can copy to the real macOS pasteboard
         // (WKWebView blocks navigator.clipboard / execCommand over http).
         config.userContentController.add(self, name: "copyText")
+        config.userContentController.add(self, name: "copySecret")
         webView = WKWebView(frame: rect, configuration: config)
         webView.navigationDelegate = self
         webView.uiDelegate = self

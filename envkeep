@@ -29,6 +29,7 @@ import os
 import secrets as _stdlib_secrets
 import shlex
 import shutil
+import time
 from datetime import datetime
 import subprocess
 import sys
@@ -55,6 +56,32 @@ ACCESS_LOG = CONFIG_DIR / "access.log"        # append-only audit trail (names, 
 def cache_enabled(cfg: dict) -> bool:
     """Whether decrypted values are cached in the Keychain. Off = decrypt-on-demand."""
     return cfg.get("cache", "none") == "keychain"
+
+
+def maybe_autolock(cfg: dict):
+    """When caching, purge cached values after `autolock` minutes of inactivity."""
+    if not cache_enabled(cfg):
+        return
+    mins = cfg.get("autolock", 15)
+    touch = CONFIG_DIR / ".cache_touch"
+    now = time.time()
+    if mins:
+        try:
+            last = float(touch.read_text())
+        except Exception:
+            last = 0.0
+        if last and (now - last) > mins * 60:
+            try:
+                data = decrypt_vault(cfg)
+                n = sum(1 for name in data["secrets"] if kc_delete(name))
+                log_access(cfg, "autolock", f"idle>{mins}m ({n})")
+            except SystemExit:
+                pass
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        touch.write_text(str(now))
+    except Exception:
+        pass
 
 
 def log_access(cfg: dict, action: str, name: str = "", source: str = "cli"):
@@ -347,6 +374,7 @@ def cmd_sync(args):
 
 def cmd_get(args):
     cfg = require_config()
+    maybe_autolock(cfg)
     if cache_enabled(cfg):
         # Keychain first (fast); fall back to the vault and cache.
         val = kc_get(args.name)
@@ -379,14 +407,23 @@ def cmd_lock(args):
 
 
 def cmd_config(args):
-    """View or change settings: cache (keychain|none), log (on|off)."""
+    """View or change settings: cache (keychain|none), log (on|off), autolock (min)."""
     cfg = require_config()
     if args.key is None:
         print(f"cache     = {cfg.get('cache', 'none')}   (keychain | none)")
+        print(f"autolock  = {cfg.get('autolock', 15)} min   (0 = off; cache mode only)")
         print(f"log       = {'on' if cfg.get('log', True) else 'off'}   (on | off)")
         print(f"vault_dir = {cfg.get('vault_dir')}")
         print(f"identity  = {IDENTITY_FILE}")
         print(f"access log= {ACCESS_LOG}")
+        return
+    if args.key == "autolock":
+        try:
+            cfg["autolock"] = max(0, int(args.value))
+        except (TypeError, ValueError):
+            die("usage: envkeep config autolock <minutes>  (0 to disable)")
+        save_config(cfg)
+        print(f"✓ autolock = {cfg['autolock']} min")
         return
     if args.key == "cache":
         if args.value not in ("keychain", "none"):
@@ -1074,9 +1111,12 @@ function toast(msg,cmd){
   t.classList.add('show');
   clearTimeout(toast._t);toast._t=setTimeout(()=>t.classList.remove('show'),2100);
 }
-async function writeClip(text,label,cmd){
-  if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.copyText){
-    window.webkit.messageHandlers.copyText.postMessage(text);return toast(label,cmd);}
+async function writeClip(text,label,cmd,sensitive){
+  const mh=window.webkit&&window.webkit.messageHandlers;
+  if(mh&&sensitive&&mh.copySecret){
+    mh.copySecret.postMessage(text);return toast(label+' (clears in 45s)',cmd);}
+  if(mh&&mh.copyText){
+    mh.copyText.postMessage(text);return toast(label,cmd);}
   let ok=false;
   try{if(navigator.clipboard&&navigator.clipboard.writeText){
     await navigator.clipboard.writeText(text);ok=true;}}catch(e){}
@@ -1175,7 +1215,7 @@ function render(){
     bCmd.onclick=()=>writeClip('envkeep get '+full,'Copied command','envkeep get '+full);
     const bCopy=el('button','iconbtn');bCopy.title='Copy value';bCopy.innerHTML=ICON.copy;
     bCopy.onclick=async()=>{try{const j=await api('/api/reveal?name='+encodeURIComponent(full));
-      writeClip(j.value,'Copied value of '+keyOf(full));}catch(e){toast(e.message);}};
+      writeClip(j.value,'Copied value of '+keyOf(full),null,true);}catch(e){toast(e.message);}};
     const bEdit=el('button','iconbtn');bEdit.title='Edit value';bEdit.innerHTML=ICON.edit;
     bEdit.onclick=()=>openModal(full);
     const bDel=el('button','iconbtn danger');bDel.title='Delete';bDel.innerHTML=ICON.trash;
@@ -1282,7 +1322,7 @@ function buildCommands(){
       run:()=>writeClip('envkeep get '+full,'Copied command','envkeep get '+full)});
     c.push({k:'value',ic:'*',label:'Copy value: '+full,
       run:async()=>{try{const j=await api('/api/reveal?name='+encodeURIComponent(full));
-        writeClip(j.value,'Copied value of '+keyOf(full));}catch(e){toast(e.message);}}});
+        writeClip(j.value,'Copied value of '+keyOf(full),null,true);}catch(e){toast(e.message);}}});
   });
   return c;
 }
@@ -1371,8 +1411,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("lock", help="purge decrypted secrets from the Keychain")
     s.set_defaults(func=cmd_lock)
 
-    s = sub.add_parser("config", help="view/change settings (cache, log)")
-    s.add_argument("key", nargs="?", choices=["cache", "log"])
+    s = sub.add_parser("config", help="view/change settings (cache, autolock, log)")
+    s.add_argument("key", nargs="?", choices=["cache", "log", "autolock"])
     s.add_argument("value", nargs="?")
     s.set_defaults(func=cmd_config)
 

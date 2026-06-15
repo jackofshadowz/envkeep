@@ -6,6 +6,7 @@
 
 **A secure, age-encrypted home for your team's ENV secrets — a native macOS app for humans, a CLI for your AI coding agents.**
 
+[![CI](https://github.com/jackofshadowz/envkeep/actions/workflows/ci.yml/badge.svg)](https://github.com/jackofshadowz/envkeep/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-7fee64.svg)](LICENSE)
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS-1b1b1f.svg)
 ![Encryption: age](https://img.shields.io/badge/encryption-age-16341d.svg)
