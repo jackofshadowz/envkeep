@@ -44,15 +44,25 @@ So you can just tell your coding agent:
 
 ## 🚀 Quickstart
 
+**Homebrew (recommended):**
+
+```bash
+brew install jackofshadowz/tap/envkeep
+envkeep init          # creates your key, vault, and recipients entry
+```
+
+**From source** (also builds the native app):
+
 ```bash
 git clone https://github.com/jackofshadowz/envkeep.git
 cd envkeep
 ./install.sh          # symlinks `envkeep` onto your PATH, installs age via brew
-envkeep init          # creates your key, vault, and recipients entry
-
-# build the native app (optional)
-./build-app.sh && open Envkeep.app
+envkeep init
+./build-app.sh && open Envkeep.app    # optional native macOS app
 ```
+
+> Prefer the app? Download `Envkeep.app` from the
+> [latest release](https://github.com/jackofshadowz/envkeep/releases/latest).
 
 Add a secret, then read it in a coding session:
 
