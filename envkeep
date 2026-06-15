@@ -23,12 +23,16 @@ from __future__ import annotations
 __version__ = "1.0.0"
 
 import argparse
+import base64
 import getpass
+import hashlib
+import hmac
 import json
 import os
 import secrets as _stdlib_secrets
 import shlex
 import shutil
+import struct
 import time
 from datetime import datetime
 import subprocess
@@ -96,6 +100,38 @@ def log_access(cfg: dict, action: str, name: str = "", source: str = "cli"):
         ACCESS_LOG.chmod(0o600)
     except Exception:
         pass
+
+
+# --------------------------------------------------------------------------- #
+# TOTP (RFC 6238) — Authy / Google Authenticator compatible, pure stdlib
+# --------------------------------------------------------------------------- #
+
+def totp_gen_secret() -> str:
+    return base64.b32encode(os.urandom(20)).decode().rstrip("=")
+
+
+def totp_at(secret: str, when: float, step: int = 30, digits: int = 6) -> str:
+    pad = "=" * (-len(secret) % 8)
+    key = base64.b32decode(secret + pad, casefold=True)
+    counter = struct.pack(">Q", int(when // step))
+    h = hmac.new(key, counter, hashlib.sha1).digest()
+    off = h[-1] & 0x0F
+    code = (struct.unpack(">I", h[off:off + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(code).zfill(digits)
+
+
+def totp_verify(secret: str, code: str, window: int = 1) -> bool:
+    code = (code or "").strip()
+    if not (secret and code.isdigit()):
+        return False
+    now = time.time()
+    return any(totp_at(secret, now + w * 30) == code for w in range(-window, window + 1))
+
+
+def totp_uri(secret: str, account: str) -> str:
+    from urllib.parse import quote
+    label = quote(f"Envkeep:{account}")
+    return f"otpauth://totp/{label}?secret={secret}&issuer=Envkeep&period=30&digits=6"
 
 
 def die(msg: str, code: int = 1):
@@ -692,6 +728,11 @@ def cmd_gui(args):
     cfg = require_config()
     token = _stdlib_secrets.token_urlsafe(24)
     host, port = "127.0.0.1", args.port
+    # session state for the 2FA unlock gate (per server process)
+    state = {"totp_unlocked_until": 0.0, "pending_totp": None}
+
+    def totp_locked() -> bool:
+        return bool(cfg.get("totp")) and time.time() > state["totp_unlocked_until"]
 
     def authed(handler) -> bool:
         return handler.headers.get("X-Auth") == token or \
@@ -723,9 +764,15 @@ def cmd_gui(args):
                 self._send(200, json.dumps(
                     {"secrets": sorted(data["secrets"]),
                      "members": read_recipients(cfg),
-                     "touchid": cfg.get("touchid", False)}))
+                     "touchid": cfg.get("touchid", False),
+                     "totp": bool(cfg.get("totp")),
+                     "locked": totp_locked(),
+                     "unlock_minutes": cfg.get("unlock_minutes", 15)}))
                 return
             if path == "/api/reveal":
+                if totp_locked():
+                    self._send(401, json.dumps({"error": "locked", "totp": True}))
+                    return
                 from urllib.parse import parse_qs, urlparse
                 q = parse_qs(urlparse(self.path).query)
                 name = q.get("name", [""])[0]
@@ -744,6 +791,8 @@ def cmd_gui(args):
                     "autolock": cfg.get("autolock", 15),
                     "log": cfg.get("log", True),
                     "touchid": cfg.get("touchid", False),
+                    "totp_enabled": bool(cfg.get("totp")),
+                    "unlock_minutes": cfg.get("unlock_minutes", 15),
                     "pubkey": pub,
                     "identity": str(IDENTITY_FILE),
                     "vault_dir": cfg.get("vault_dir", ""),
@@ -810,10 +859,54 @@ def cmd_gui(args):
                         cfg["log"] = bool(value)
                     elif key == "touchid":
                         cfg["touchid"] = bool(value)
+                    elif key == "unlock_minutes":
+                        cfg["unlock_minutes"] = max(1, int(value))
                     else:
                         raise ValueError("unknown setting")
                     save_config(cfg)
                     self._send(200, json.dumps({"ok": True}))
+                    return
+                if path == "/api/totp/setup":
+                    secret = totp_gen_secret()
+                    state["pending_totp"] = secret
+                    import getpass as _gp
+                    self._send(200, json.dumps({
+                        "secret": secret,
+                        "uri": totp_uri(secret, _gp.getuser())}))
+                    return
+                if path == "/api/totp/enable":
+                    pend = state.get("pending_totp")
+                    if not pend:
+                        raise ValueError("run setup first")
+                    if not totp_verify(pend, payload.get("code")):
+                        raise ValueError("incorrect code — try again")
+                    cfg["totp"] = pend
+                    state["pending_totp"] = None
+                    state["totp_unlocked_until"] = time.time() + cfg.get("unlock_minutes", 15) * 60
+                    save_config(cfg)
+                    log_access(cfg, "2fa-enable", "", "gui")
+                    self._send(200, json.dumps({"ok": True}))
+                    return
+                if path == "/api/totp/disable":
+                    if not cfg.get("totp"):
+                        raise ValueError("2FA is not enabled")
+                    if not totp_verify(cfg["totp"], payload.get("code")):
+                        raise ValueError("incorrect code")
+                    cfg.pop("totp", None)
+                    save_config(cfg)
+                    log_access(cfg, "2fa-disable", "", "gui")
+                    self._send(200, json.dumps({"ok": True}))
+                    return
+                if path == "/api/totp/unlock":
+                    if not cfg.get("totp"):
+                        self._send(200, json.dumps({"ok": True}))
+                        return
+                    if not totp_verify(cfg["totp"], payload.get("code")):
+                        raise ValueError("incorrect code")
+                    mins = cfg.get("unlock_minutes", 15)
+                    state["totp_unlocked_until"] = time.time() + mins * 60
+                    log_access(cfg, "unlock", f"{mins}m", "gui")
+                    self._send(200, json.dumps({"ok": True, "minutes": mins}))
                     return
                 if path == "/api/add-member":
                     alias = (payload.get("alias") or "").strip()
@@ -1167,6 +1260,15 @@ INDEX_HTML = r"""<!doctype html>
         <div class="set-card">
           <h3>Security</h3>
           <div class="set-row">
+            <div><div class="set-label">Security level</div>
+              <div class="set-help">Quick presets — pick one, or fine-tune below.</div></div>
+            <div class="seg" id="seg-level">
+              <button data-v="relaxed">Relaxed</button>
+              <button data-v="balanced">Balanced</button>
+              <button data-v="strict">Strict</button>
+            </div>
+          </div>
+          <div class="set-row">
             <div><div class="set-label">Storage mode</div>
               <div class="set-help">Where decrypted values live between reads.</div></div>
             <div class="seg" id="seg-cache">
@@ -1190,9 +1292,41 @@ INDEX_HTML = r"""<!doctype html>
             <label class="switch"><input type="checkbox" id="set-touchid"><span></span></label>
           </div>
           <div class="set-row">
+            <div><div class="set-label">Auto-relock after</div>
+              <div class="set-help">Re-prompt for Touch ID / 2FA once a session is idle this long.</div></div>
+            <div><input type="number" min="1" id="set-relock" class="set-num"> <span class="set-help">min</span></div>
+          </div>
+          <div class="set-row">
             <div><div class="set-label">Lock now</div>
               <div class="set-help">Purge any cached plaintext from the Keychain.</div></div>
             <button class="btn" id="set-lock">Lock</button>
+          </div>
+        </div>
+
+        <div class="set-card">
+          <h3>Two-factor (authenticator app) <span class="set-help" id="totp-state"></span></h3>
+          <div id="totp-off">
+            <div class="set-help" style="padding:8px 2px">
+              Require a 6-digit code from Authy, Google Authenticator, or 1Password
+              before revealing or copying a value.</div>
+            <button class="btn primary" id="totp-start">Enable 2FA</button>
+          </div>
+          <div id="totp-setup" hidden>
+            <div class="set-help" style="padding:6px 2px">1. Add this key to your authenticator (or scan the URI):</div>
+            <div class="set-kv"><span>Setup key</span><code id="totp-secret"></code>
+              <button class="btn sm" id="totp-copysecret">Copy</button></div>
+            <div class="set-kv"><span>otpauth URI</span><code id="totp-uri"></code>
+              <button class="btn sm" id="totp-copyuri">Copy</button></div>
+            <div class="set-help" style="padding:6px 2px">2. Enter the current 6-digit code to confirm:</div>
+            <div class="set-add">
+              <input id="totp-confirm" inputmode="numeric" maxlength="6" placeholder="000000">
+              <button class="btn primary" id="totp-enable">Confirm &amp; enable</button>
+              <button class="btn" id="totp-cancel">Cancel</button>
+            </div>
+          </div>
+          <div id="totp-on" hidden>
+            <div class="set-help" style="padding:8px 2px">✓ 2FA is on. Reveals require a code after the session locks.</div>
+            <button class="btn danger" id="totp-disable">Disable 2FA</button>
           </div>
         </div>
 
@@ -1258,6 +1392,21 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </div>
 
+<!-- 2FA unlock prompt -->
+<div class="overlay" id="unlockModal" hidden>
+  <div class="dialog sm">
+    <h2>🔒 Locked</h2>
+    <p class="muted">Enter your 6-digit authenticator code to unlock.</p>
+    <input id="unlock-code" inputmode="numeric" maxlength="6" placeholder="000000"
+      autocomplete="one-time-code" style="margin-top:14px;text-align:center;
+      font-size:22px;letter-spacing:6px">
+    <div class="dialog-actions">
+      <button class="btn ghost" id="unlock-cancel">Cancel</button>
+      <button class="btn primary" id="unlock-ok">Unlock</button>
+    </div>
+  </div>
+</div>
+
 <!-- command palette -->
 <div class="overlay cmdk" id="palette" hidden>
   <div class="panel">
@@ -1287,11 +1436,42 @@ let MEMBERS=[];
 let current=null;      // selected folder, null = all
 let search="";
 let TOUCHID=false;     // require biometric before revealing (native app only)
+let UNLOCK_MIN=15;     // auto-relock window (minutes)
+let bioUntil=0;        // Touch ID session valid until (client ms)
 async function requireAuth(reason){
   const mh=window.webkit&&window.webkit.messageHandlers;
   if(!TOUCHID||!(mh&&mh.auth))return true;   // off, or running in a plain browser
-  try{return !!(await mh.auth.postMessage(reason||'reveal a secret'));}
+  if(Date.now()<bioUntil)return true;        // still inside the unlocked window
+  try{const ok=!!(await mh.auth.postMessage(reason||'reveal a secret'));
+    if(ok)bioUntil=Date.now()+UNLOCK_MIN*60000;return ok;}
   catch(e){return false;}
+}
+// reveal with the server-side 2FA gate (prompts for a code when locked)
+async function apiReveal(full){
+  try{return await api('/api/reveal?name='+encodeURIComponent(full));}
+  catch(e){
+    if((e.message||'').includes('locked')){
+      if(await unlockFlow())return await api('/api/reveal?name='+encodeURIComponent(full));
+      throw new Error('locked');
+    }
+    throw e;
+  }
+}
+let _codeResolve=null;
+function promptCode(title,help,okLabel){
+  $('#unlockModal').querySelector('h2').textContent=title;
+  $('#unlockModal').querySelector('p').textContent=help;
+  $('#unlock-ok').textContent=okLabel||'Unlock';
+  return new Promise(res=>{_codeResolve=res;$('#unlock-code').value='';
+    $('#unlockModal').hidden=false;setTimeout(()=>$('#unlock-code').focus(),30);});
+}
+function resolveCode(v){$('#unlockModal').hidden=true;
+  const r=_codeResolve;_codeResolve=null;if(r)r(v);}
+async function unlockFlow(){
+  const code=await promptCode('Locked','Enter your 6-digit authenticator code to unlock.','Unlock');
+  if(code==null)return false;
+  try{await api('/api/totp/unlock',{method:'POST',body:JSON.stringify({code})});return true;}
+  catch(e){toast(e.message);return false;}
 }
 const revealed={};     // full -> value (cached after reveal)
 
@@ -1413,7 +1593,7 @@ function render(){
     eye.onclick=async()=>{
       if(revealed[full]!=null){delete revealed[full];paint();return;}
       if(!await requireAuth('reveal '+keyOf(full))){toast('Authentication required');return;}
-      try{const j=await api('/api/reveal?name='+encodeURIComponent(full));
+      try{const j=await apiReveal(full);
         revealed[full]=j.value;paint();}catch(e){toast(e.message);}
     };
     wrap.appendChild(eye);wrap.appendChild(code);
@@ -1428,7 +1608,7 @@ function render(){
     const bCopy=el('button','iconbtn');bCopy.title='Copy value';bCopy.innerHTML=ICON.copy;
     bCopy.onclick=async()=>{
       if(!await requireAuth('copy '+keyOf(full))){toast('Authentication required');return;}
-      try{const j=await api('/api/reveal?name='+encodeURIComponent(full));
+      try{const j=await apiReveal(full);
       writeClip(j.value,'Copied value of '+keyOf(full),null,true);}catch(e){toast(e.message);}};
     const bEdit=el('button','iconbtn');bEdit.title='Edit value';bEdit.innerHTML=ICON.edit;
     bEdit.onclick=()=>openModal(full);
@@ -1457,7 +1637,7 @@ async function openModal(edit){
     fF.disabled=true;fN.disabled=true;            // identity locked while editing
     fV.value='';fV.placeholder='Enter a new value...';
     $('#modal').hidden=false;
-    try{const j=await api('/api/reveal?name='+encodeURIComponent(editing));fV.value=j.value;}catch(e){}
+    try{const j=await apiReveal(editing);fV.value=j.value;}catch(e){}
     setTimeout(()=>fV.focus(),30);
   } else {
     $('#modalTitle').textContent='New secret';
@@ -1508,7 +1688,7 @@ async function lock(){
 
 async function load(){
   const j=await api('/api/list');
-  SECRETS=j.secrets;MEMBERS=j.members;TOUCHID=!!j.touchid;
+  SECRETS=j.secrets;MEMBERS=j.members;TOUCHID=!!j.touchid;UNLOCK_MIN=j.unlock_minutes||15;
   $('#memcount').innerHTML='<svg width="13" height="13" viewBox="0 0 24 24" fill="none" '
     +'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
     +'<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>'
@@ -1524,11 +1704,19 @@ async function openSettings(){
   let j;
   try{j=await api('/api/settings');}catch(e){toast(e.message);return;}
   // security
+  const lvl=currentLevel(j);
+  [...$('#seg-level').children].forEach(b=>b.classList.toggle('on',b.dataset.v===lvl));
   [...$('#seg-cache').children].forEach(b=>b.classList.toggle('on',b.dataset.v===j.cache));
   $('#row-autolock').style.display=(j.cache==='keychain')?'':'none';
   $('#set-autolock').value=j.autolock;
+  $('#set-relock').value=j.unlock_minutes;UNLOCK_MIN=j.unlock_minutes;
   $('#set-log').checked=!!j.log;
   $('#set-touchid').checked=!!j.touchid;TOUCHID=!!j.touchid;
+  // two-factor
+  $('#totp-state').textContent=j.totp_enabled?'· enabled':'· off';
+  $('#totp-off').hidden=j.totp_enabled;
+  $('#totp-on').hidden=!j.totp_enabled;
+  $('#totp-setup').hidden=true;
   // identity
   $('#set-pub').textContent=j.pubkey||'(unavailable)';
   $('#set-identity').textContent=j.identity;
@@ -1545,6 +1733,20 @@ async function openSettings(){
     row.appendChild(el('code',null,m.key));
     mm.appendChild(row);
   });
+}
+function currentLevel(j){
+  if(j.cache==='keychain'&&!j.touchid&&!j.totp_enabled)return 'relaxed';
+  if(j.cache==='none'&&j.touchid&&!j.totp_enabled)return 'balanced';
+  if(j.cache==='none'&&j.touchid&&j.totp_enabled)return 'strict';
+  return null;  // custom
+}
+async function applyLevel(v){
+  const sets=v==='relaxed'?[['cache','keychain'],['touchid',false],['autolock',60],['unlock_minutes',60]]
+    :v==='balanced'?[['cache','none'],['touchid',true],['unlock_minutes',15]]
+    :[['cache','none'],['touchid',true],['unlock_minutes',5]];
+  for(const [k,val] of sets)await setConfig(k,val);
+  toast('Security level: '+v+(v==='strict'?' — add 2FA for max':''));
+  openSettings();
 }
 async function setConfig(key,value){
   try{await api('/api/config',{method:'POST',body:JSON.stringify({key,value})});
@@ -1568,7 +1770,7 @@ function buildCommands(){
     c.push({k:'cmd',ic:'>',label:'Copy command: '+full,sub:'envkeep get '+full,
       run:()=>writeClip('envkeep get '+full,'Copied command','envkeep get '+full)});
     c.push({k:'value',ic:'*',label:'Copy value: '+full,
-      run:async()=>{try{const j=await api('/api/reveal?name='+encodeURIComponent(full));
+      run:async()=>{try{const j=await apiReveal(full);
         writeClip(j.value,'Copied value of '+keyOf(full),null,true);}catch(e){toast(e.message);}}});
   });
   return c;
@@ -1624,6 +1826,40 @@ $('#set-touchid').addEventListener('change',async e=>{
     toast('Touch ID '+(e.target.checked?'required to reveal':'off'));}
   else e.target.checked=!e.target.checked;
 });
+// security level presets
+$('#seg-level').addEventListener('click',e=>{
+  const b=e.target.closest('button[data-v]');if(b)applyLevel(b.dataset.v);});
+// auto-relock window
+$('#set-relock').addEventListener('change',async e=>{
+  const v=Math.max(1,parseInt(e.target.value||'15',10));
+  if(await setConfig('unlock_minutes',v)){UNLOCK_MIN=v;toast('Auto-relock: '+v+' min');}
+});
+// two-factor enroll / disable
+$('#totp-start').onclick=async()=>{
+  try{const j=await api('/api/totp/setup',{method:'POST',body:'{}'});
+    $('#totp-secret').textContent=j.secret;$('#totp-uri').textContent=j.uri;
+    $('#totp-copysecret').onclick=()=>writeClip(j.secret,'Copied setup key');
+    $('#totp-copyuri').onclick=()=>writeClip(j.uri,'Copied otpauth URI');
+    $('#totp-off').hidden=true;$('#totp-setup').hidden=false;
+    setTimeout(()=>$('#totp-confirm').focus(),30);
+  }catch(e){toast(e.message);}
+};
+$('#totp-cancel').onclick=()=>{$('#totp-setup').hidden=true;$('#totp-off').hidden=false;};
+$('#totp-enable').onclick=async()=>{
+  const code=$('#totp-confirm').value.trim();
+  try{await api('/api/totp/enable',{method:'POST',body:JSON.stringify({code})});
+    toast('2FA enabled');await load();openSettings();}catch(e){toast(e.message);}
+};
+$('#totp-disable').onclick=async()=>{
+  const code=await promptCode('Disable 2FA','Enter a current 6-digit code to confirm.','Disable');
+  if(code==null)return;
+  try{await api('/api/totp/disable',{method:'POST',body:JSON.stringify({code})});
+    toast('2FA disabled');await load();openSettings();}catch(e){toast(e.message);}
+};
+// unlock modal
+$('#unlock-ok').onclick=()=>resolveCode($('#unlock-code').value.trim());
+$('#unlock-cancel').onclick=()=>resolveCode(null);
+$('#unlock-code').addEventListener('keydown',e=>{if(e.key==='Enter')resolveCode(e.target.value.trim());});
 $('#set-lock').onclick=lock;
 $('#set-addmember').onclick=async()=>{
   const alias=$('#set-alias').value.trim();
