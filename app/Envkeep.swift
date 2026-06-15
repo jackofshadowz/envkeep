@@ -8,8 +8,29 @@
 
 import Cocoa
 import WebKit
+import LocalAuthentication
 
-final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScriptMessageHandler {
+final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
+                         WKScriptMessageHandler, WKScriptMessageHandlerWithReply {
+    // Touch ID / password gate. JS: await window.webkit.messageHandlers.auth.postMessage(reason)
+    func userContentController(_ controller: WKUserContentController,
+                              didReceive message: WKScriptMessage,
+                              replyHandler: @escaping (Any?, String?) -> Void) {
+        guard message.name == "auth" else { replyHandler(nil, "unknown"); return }
+        let reason = (message.body as? String) ?? "reveal a secret"
+        let ctx = LAContext()
+        ctx.localizedFallbackTitle = "Enter Password"
+        var err: NSError?
+        if ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &err) {
+            ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { ok, _ in
+                DispatchQueue.main.async { replyHandler(ok, nil) }
+            }
+        } else {
+            // No biometric/password available — don't lock the user out.
+            replyHandler(true, nil)
+        }
+    }
+
     // JS copies via window.webkit.messageHandlers.{copyText,copySecret}.postMessage(value).
     // copySecret additionally wipes the pasteboard ~45s later (if still unchanged).
     func userContentController(_ controller: WKUserContentController,
@@ -52,6 +73,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         // (WKWebView blocks navigator.clipboard / execCommand over http).
         config.userContentController.add(self, name: "copyText")
         config.userContentController.add(self, name: "copySecret")
+        config.userContentController.addScriptMessageHandler(self, contentWorld: .page, name: "auth")
         webView = WKWebView(frame: rect, configuration: config)
         webView.navigationDelegate = self
         webView.uiDelegate = self

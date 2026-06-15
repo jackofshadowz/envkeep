@@ -432,6 +432,7 @@ def cmd_config(args):
     if args.key is None:
         print(f"cache     = {cfg.get('cache', 'none')}   (keychain | none)")
         print(f"autolock  = {cfg.get('autolock', 15)} min   (0 = off; cache mode only)")
+        print(f"touchid   = {'on' if cfg.get('touchid', False) else 'off'}   (on | off; native app)")
         print(f"log       = {'on' if cfg.get('log', True) else 'off'}   (on | off)")
         print(f"vault_dir = {cfg.get('vault_dir')}")
         print(f"identity  = {IDENTITY_FILE}")
@@ -464,6 +465,12 @@ def cmd_config(args):
         cfg["log"] = (args.value == "on")
         save_config(cfg)
         print(f"✓ log = {args.value}")
+    elif args.key == "touchid":
+        if args.value not in ("on", "off"):
+            die("usage: envkeep config touchid on|off")
+        cfg["touchid"] = (args.value == "on")
+        save_config(cfg)
+        print(f"✓ touchid = {args.value}")
 
 
 def cmd_log(args):
@@ -715,7 +722,8 @@ def cmd_gui(args):
                 data = decrypt_vault(cfg)
                 self._send(200, json.dumps(
                     {"secrets": sorted(data["secrets"]),
-                     "members": read_recipients(cfg)}))
+                     "members": read_recipients(cfg),
+                     "touchid": cfg.get("touchid", False)}))
                 return
             if path == "/api/reveal":
                 from urllib.parse import parse_qs, urlparse
@@ -735,6 +743,7 @@ def cmd_gui(args):
                     "cache": cfg.get("cache", "none"),
                     "autolock": cfg.get("autolock", 15),
                     "log": cfg.get("log", True),
+                    "touchid": cfg.get("touchid", False),
                     "pubkey": pub,
                     "identity": str(IDENTITY_FILE),
                     "vault_dir": cfg.get("vault_dir", ""),
@@ -799,6 +808,8 @@ def cmd_gui(args):
                         cfg["autolock"] = max(0, int(value))
                     elif key == "log":
                         cfg["log"] = bool(value)
+                    elif key == "touchid":
+                        cfg["touchid"] = bool(value)
                     else:
                         raise ValueError("unknown setting")
                     save_config(cfg)
@@ -1174,6 +1185,11 @@ INDEX_HTML = r"""<!doctype html>
             <label class="switch"><input type="checkbox" id="set-log"><span></span></label>
           </div>
           <div class="set-row">
+            <div><div class="set-label">Require Touch ID to reveal</div>
+              <div class="set-help">Prompt for Touch ID / password before showing or copying a value (native app).</div></div>
+            <label class="switch"><input type="checkbox" id="set-touchid"><span></span></label>
+          </div>
+          <div class="set-row">
             <div><div class="set-label">Lock now</div>
               <div class="set-help">Purge any cached plaintext from the Keychain.</div></div>
             <button class="btn" id="set-lock">Lock</button>
@@ -1270,6 +1286,13 @@ let SECRETS=[];        // full paths
 let MEMBERS=[];
 let current=null;      // selected folder, null = all
 let search="";
+let TOUCHID=false;     // require biometric before revealing (native app only)
+async function requireAuth(reason){
+  const mh=window.webkit&&window.webkit.messageHandlers;
+  if(!TOUCHID||!(mh&&mh.auth))return true;   // off, or running in a plain browser
+  try{return !!(await mh.auth.postMessage(reason||'reveal a secret'));}
+  catch(e){return false;}
+}
 const revealed={};     // full -> value (cached after reveal)
 
 async function api(path,opts={}){
@@ -1389,6 +1412,7 @@ function render(){
     paint();
     eye.onclick=async()=>{
       if(revealed[full]!=null){delete revealed[full];paint();return;}
+      if(!await requireAuth('reveal '+keyOf(full))){toast('Authentication required');return;}
       try{const j=await api('/api/reveal?name='+encodeURIComponent(full));
         revealed[full]=j.value;paint();}catch(e){toast(e.message);}
     };
@@ -1402,7 +1426,9 @@ function render(){
     bCmd.innerHTML=ICON.term;
     bCmd.onclick=()=>writeClip('envkeep get '+full,'Copied command','envkeep get '+full);
     const bCopy=el('button','iconbtn');bCopy.title='Copy value';bCopy.innerHTML=ICON.copy;
-    bCopy.onclick=async()=>{try{const j=await api('/api/reveal?name='+encodeURIComponent(full));
+    bCopy.onclick=async()=>{
+      if(!await requireAuth('copy '+keyOf(full))){toast('Authentication required');return;}
+      try{const j=await api('/api/reveal?name='+encodeURIComponent(full));
       writeClip(j.value,'Copied value of '+keyOf(full),null,true);}catch(e){toast(e.message);}};
     const bEdit=el('button','iconbtn');bEdit.title='Edit value';bEdit.innerHTML=ICON.edit;
     bEdit.onclick=()=>openModal(full);
@@ -1482,7 +1508,7 @@ async function lock(){
 
 async function load(){
   const j=await api('/api/list');
-  SECRETS=j.secrets;MEMBERS=j.members;
+  SECRETS=j.secrets;MEMBERS=j.members;TOUCHID=!!j.touchid;
   $('#memcount').innerHTML='<svg width="13" height="13" viewBox="0 0 24 24" fill="none" '
     +'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
     +'<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>'
@@ -1502,6 +1528,7 @@ async function openSettings(){
   $('#row-autolock').style.display=(j.cache==='keychain')?'':'none';
   $('#set-autolock').value=j.autolock;
   $('#set-log').checked=!!j.log;
+  $('#set-touchid').checked=!!j.touchid;TOUCHID=!!j.touchid;
   // identity
   $('#set-pub').textContent=j.pubkey||'(unavailable)';
   $('#set-identity').textContent=j.identity;
@@ -1592,6 +1619,11 @@ $('#set-autolock').addEventListener('change',async e=>{
 $('#set-log').addEventListener('change',async e=>{
   if(await setConfig('log',e.target.checked))toast('Access log '+(e.target.checked?'on':'off'));
 });
+$('#set-touchid').addEventListener('change',async e=>{
+  if(await setConfig('touchid',e.target.checked)){TOUCHID=e.target.checked;
+    toast('Touch ID '+(e.target.checked?'required to reveal':'off'));}
+  else e.target.checked=!e.target.checked;
+});
 $('#set-lock').onclick=lock;
 $('#set-addmember').onclick=async()=>{
   const alias=$('#set-alias').value.trim();
@@ -1655,7 +1687,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_lock)
 
     s = sub.add_parser("config", help="view/change settings (cache, autolock, log)")
-    s.add_argument("key", nargs="?", choices=["cache", "log", "autolock"])
+    s.add_argument("key", nargs="?", choices=["cache", "log", "autolock", "touchid"])
     s.add_argument("value", nargs="?")
     s.set_defaults(func=cmd_config)
 
