@@ -20,6 +20,8 @@ macOS `security` tool.
 
 from __future__ import annotations
 
+__version__ = "1.0.0"
+
 import argparse
 import getpass
 import json
@@ -91,6 +93,10 @@ def load_config() -> dict:
 
 def save_config(cfg: dict):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        CONFIG_DIR.chmod(0o700)          # owner-only access to keys/config/log
+    except OSError:
+        pass
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
     CONFIG_FILE.chmod(0o600)
 
@@ -464,6 +470,94 @@ def cmd_env(args):
             print(f"export {key}={shlex.quote(val)}")
 
 
+def parse_env(text: str) -> dict:
+    """Parse KEY=VALUE lines from a .env file (ignores comments/blank/export)."""
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        if k:
+            out[k] = v
+    return out
+
+
+def cmd_import(args):
+    """Scan a directory for .env files and import them into a project folder.
+
+    Dry-run by default — prints only NAMES, never values. Re-run with --apply.
+    """
+    cfg = require_config()
+    root = Path(args.dir).expanduser()
+    if not root.exists():
+        die(f"no such directory: {root}")
+    project = (args.project or root.resolve().name).strip("/")
+
+    skip_names = {".env.example", ".env.sample", ".env.template", ".env.dist"}
+    skip_dirs = {"node_modules", ".git", ".venv", "venv", "__pycache__",
+                 "dist", "build", ".next", "target"}
+    files = []
+    for p in sorted(root.rglob(".env*")):
+        if not p.is_file():
+            continue
+        if p.name in skip_names or any(part in skip_dirs for part in p.parts):
+            continue
+        files.append(p)
+    if not files:
+        die(f"no .env files found under {root}")
+
+    found = {}                       # KEY -> (value, source file)
+    for f in files:
+        try:
+            for k, v in parse_env(f.read_text()).items():
+                found[k] = (v, f)
+        except Exception:
+            info(f"warning: could not read {f}")
+    if not found:
+        die("found .env file(s) but no KEY=VALUE entries.")
+
+    data = decrypt_vault(cfg)
+    existing = set(data["secrets"])
+    info(f"Found {len(found)} variable(s) in {len(files)} file(s) "
+         f"-> project '{project}':\n")
+    new = 0
+    for k in sorted(found):
+        full = f"{project}/{k}"
+        if full in existing:
+            tag = "overwrite" if args.overwrite else "skip (exists)"
+        else:
+            tag = "new"; new += 1
+        print(f"  [{tag:>13}]  {full}")
+
+    if not args.apply:
+        info(f"\nDry run — {new} new. Re-run with --apply to import"
+             + ("" if args.overwrite else " (add --overwrite to replace existing)") + ".")
+        return
+
+    n = 0
+    for k, (v, _src) in found.items():
+        full = f"{project}/{k}"
+        if full in existing and not args.overwrite:
+            continue
+        data["secrets"][full] = v
+        if cache_enabled(cfg):
+            kc_set(full, v)
+        n += 1
+    if n:
+        encrypt_vault(cfg, data)
+        git_commit_push(cfg, f"import {n} secret(s) into {project}")
+        log_access(cfg, "import", f"{project} ({n})")
+    print(f"\n✓ Imported {n} secret(s) into '{project}'.")
+
+
 def cmd_set(args):
     cfg = require_config()
     git_sync_pull(cfg)
@@ -740,6 +834,8 @@ INDEX_HTML = r"""<!doctype html>
 
   .folderbar{display:flex;align-items:center;gap:8px;padding:12px 26px;
        border-bottom:1px solid var(--line);background:var(--panel)}
+  .folderbar[hidden]{display:none}
+  [hidden]{display:none !important}
   .folderbar .fb-name{font-family:var(--mono);font-size:12.5px;color:var(--muted);
        background:var(--green-tint);border:1px solid var(--green-line);
        padding:3px 9px;border-radius:20px}
@@ -1216,7 +1312,7 @@ function highlight(){const box=$('#presults');
   const a=box.children[palIdx];if(a&&a.scrollIntoView)a.scrollIntoView({block:'nearest'});}
 
 // wire up
-$('#newBtn').onclick=openModal;
+$('#newBtn').onclick=()=>openModal();
 $('#m_cancel').onclick=closeModal;
 $('#m_save').onclick=saveModal;
 $('#c_cancel').onclick=closeConfirm;
@@ -1258,6 +1354,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="envkeep",
         description="Secure ENV-secret manager (age vault + macOS Keychain).")
+    p.add_argument("--version", action="version", version=f"envkeep {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("init", help="set up your key, vault and recipients")
@@ -1289,6 +1386,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("folders", help="list folders/projects")
     s.set_defaults(func=cmd_folders)
+
+    s = sub.add_parser("import", help="scan a dir for .env files and import them")
+    s.add_argument("dir")
+    s.add_argument("--project", help="project folder (default: directory name)")
+    s.add_argument("--apply", action="store_true", help="import (default: dry run)")
+    s.add_argument("--overwrite", action="store_true", help="replace existing secrets")
+    s.set_defaults(func=cmd_import)
 
     s = sub.add_parser("env", help="print a whole folder as export/.env lines")
     s.add_argument("prefix", help="folder/project name")
