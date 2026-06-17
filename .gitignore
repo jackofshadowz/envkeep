@@ -18,3 +18,8 @@ recipients.txt
 
 # local marketing drafts — not part of the project
 launch-drafts/
+
+# python build artifacts
+build/
+dist/
+*.egg-info/

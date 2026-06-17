@@ -51,6 +51,20 @@ brew install jackofshadowz/tap/envkeep
 envkeep init          # creates your key, vault, and recipients entry
 ```
 
+**curl one-liner:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jackofshadowz/envkeep/main/web-install.sh | bash
+envkeep init
+```
+
+**pipx / pip** (Python tool):
+
+```bash
+pipx install envkeep        # or: pip install envkeep
+envkeep init
+```
+
 **From source** (also builds the native app):
 
 ```bash
@@ -101,11 +115,20 @@ envkeep folders                          # list projects
 envkeep env  my-app [--dotenv]           # export lines (or .env format)
 envkeep import ./path [--apply]          # scan .env files (dry-run by default)
 envkeep rm   my-app/STRIPE_KEY
-envkeep lock                             # purge cached plaintext
-envkeep config [cache keychain|none] [log on|off]
-envkeep log [--tail N]                   # access log
 envkeep pubkey | members | add-member alice age1…
 envkeep gui                              # the same UI in your browser
+
+# security
+envkeep protect-key      # encrypt the vault key with a passphrase
+envkeep unlock           # unlock the passphrase-protected key for this session
+envkeep lock             # re-lock the key / 2FA + purge cached plaintext
+envkeep unprotect-key    # remove passphrase protection
+envkeep config           # view settings
+envkeep config cache keychain|none       # plaintext cache vs decrypt-on-demand
+envkeep config autolock <minutes>        # auto-relock window (cache mode)
+envkeep config touchid on|off            # Touch ID gate (app)
+envkeep config log on|off                # access log
+envkeep log [--tail N]                   # show the access log
 ```
 
 GUI shortcuts: **⌘K** palette · **n** new · **/** search · **l** lock · **Esc** close · **⌘↵** save.
@@ -118,15 +141,46 @@ GUI shortcuts: **⌘K** palette · **n** new · **/** search · **l** lock · **
 
 ## 🔒 Security
 
-* Only **ciphertext** is ever stored or pushed — a stolen repo/laptop-at-rest exposes nothing.
-* **The CLI runs as you**, so your coding agent can read any secret it's told to. Prefer handing it the *name* (or `envkeep env`) and injecting via the environment rather than printing values into a transcript.
-* Removing a member re-encrypts going forward — **rotate** anything they knew.
-* Back up `identity.txt` (e.g. a password manager); lose it and you lose access until re-added.
-* Lightweight by design — **not** a replacement for HashiCorp Vault / an HSM.
+Envkeep is layered — turn on as much as you need. Configure it all in **Settings**
+(GUI) or via `envkeep config` / the commands above.
+
+### Security levels
+One-click presets in Settings:
+
+| Level | Storage | Gate |
+|---|---|---|
+| **Relaxed** | Keychain cache (fast) | none |
+| **Balanced** | decrypt-on-demand | Touch ID |
+| **Strict** | decrypt-on-demand | Touch ID + short auto-relock (add 2FA for max) |
+
+### Storage modes
+- **Decrypt-on-demand** (default) — no plaintext is persisted anywhere; every read decrypts the vault.
+- **Keychain cache** (`envkeep config cache keychain`) — decrypted values cached in the macOS Keychain for speed, purged by **auto-lock** (`config autolock <min>`) or `envkeep lock`.
+
+### Gates (protect reveal/copy in the app)
+- **Touch ID** (`config touchid on`) — biometric/password before a value is shown or copied.
+- **Two-factor / TOTP** — a 6-digit code from **Authy, Google Authenticator, or 1Password**. Enroll in Settings → Two-factor; reveals are then gated until you enter a code.
+- **Auto-relock** — Touch ID and 2FA sessions expire after the configured window, then re-prompt.
+- **Lock** (`envkeep lock`, or the app button) — immediately re-locks every enabled gate + purges the cache. With **no** gate enabled it only purges the cache (the app warns you).
+
+### At-rest key protection
+- **Passphrase-encrypted key** (`envkeep protect-key`, or Settings → Vault key encryption) — encrypts your age identity itself (openssl AES-256 + PBKDF2). The plaintext key file is removed, so a **stolen key file is useless**. Unlock once per session (`envkeep unlock` or the app's unlock screen). ⚠ No recovery if you forget the passphrase.
+
+### Other
+- **Clipboard auto-clear** — copied secret *values* are wiped from the pasteboard ~45s later (native app).
+- **Audit log** — every read/write is appended to `~/.config/envkeep/access.log` (names + actions, **never values**).
+
+### Honest caveats
+- Only **ciphertext** is ever stored or pushed — a stolen repo / laptop-at-rest exposes nothing.
+- **The CLI runs as you**, so a coding agent you trust to run commands can read any secret it's pointed at. Prefer handing it the *name* (or `envkeep env`) and injecting via the environment rather than printing values into a transcript.
+- The Touch ID / 2FA gates protect the **app reveal path**; they don't gate the CLI (agents need it). For true at-rest protection of the key, use **passphrase encryption**.
+- Removing a member re-encrypts going forward — **rotate** anything they knew.
+- Back up your key/passphrase (e.g. a password manager); lose them and you lose access.
+- Lightweight by design — **not** a replacement for HashiCorp Vault / an HSM.
 
 ## 📦 Requirements
 
-macOS · `age` + `age-keygen` (`brew install age`) · Python 3 (system Python is fine) · Xcode CLT (`swiftc`) for the native app.
+macOS · `age` + `age-keygen` (`brew install age`) · Python 3 (system Python is fine) · `openssl` (ships with macOS; used for passphrase key encryption) · Xcode CLT (`swiftc`) for the native app.
 
 ## 📄 License
 
