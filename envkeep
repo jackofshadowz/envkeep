@@ -55,6 +55,13 @@ if not CONFIG_DIR.exists() and _LEGACY_DIR.exists():
 CONFIG_FILE = CONFIG_DIR / "config.json"
 IDENTITY_FILE = CONFIG_DIR / "identity.txt"   # YOUR age private key (chmod 600)
 ACCESS_LOG = CONFIG_DIR / "access.log"        # append-only audit trail (names, not values)
+ENC_IDENTITY = CONFIG_DIR / "identity.enc"    # passphrase-encrypted identity (when protected)
+SESSION_ID = CONFIG_DIR / ".session-identity" # decrypted identity for the unlocked window
+SESSION_EXP = CONFIG_DIR / ".session-exp"     # epoch when the unlock window ends
+
+
+class Locked(Exception):
+    """Raised when the vault key is passphrase-protected and not unlocked."""
 
 
 def cache_enabled(cfg: dict) -> bool:
@@ -187,11 +194,74 @@ def recipients_file(cfg: dict) -> Path:
 # age encryption helpers
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# Passphrase protection of the identity key (openssl AES-256 + PBKDF2)
+# --------------------------------------------------------------------------- #
+
+def key_protected(cfg: dict) -> bool:
+    return bool(cfg.get("key_protected"))
+
+
+def _openssl(args: list, passphrase: str) -> tuple:
+    out = subprocess.run(["openssl", *args, "-pass", "stdin"],
+                         input=(passphrase + "\n").encode(), capture_output=True)
+    return out.returncode == 0, out.stderr.decode().strip()
+
+
+def encrypt_identity(passphrase: str) -> bool:
+    ok, _ = _openssl(["enc", "-aes-256-cbc", "-pbkdf2", "-iter", "200000", "-salt",
+                      "-in", str(IDENTITY_FILE), "-out", str(ENC_IDENTITY)], passphrase)
+    if ok:
+        ENC_IDENTITY.chmod(0o600)
+    return ok
+
+
+def session_valid() -> bool:
+    if not SESSION_ID.exists():
+        return False
+    try:
+        if time.time() > float(SESSION_EXP.read_text()):
+            clear_session()
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def clear_session():
+    for p in (SESSION_ID, SESSION_EXP):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def start_session(cfg: dict, passphrase: str) -> bool:
+    ok, _ = _openssl(["enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "200000",
+                      "-in", str(ENC_IDENTITY), "-out", str(SESSION_ID)], passphrase)
+    if not ok:
+        clear_session()
+        return False
+    SESSION_ID.chmod(0o600)
+    SESSION_EXP.write_text(str(time.time() + cfg.get("unlock_minutes", 15) * 60))
+    return True
+
+
+def active_identity(cfg: dict) -> Path:
+    """Path to a usable plaintext identity, or raise Locked if protected & locked."""
+    if not key_protected(cfg):
+        return IDENTITY_FILE
+    if session_valid():
+        return SESSION_ID
+    raise Locked()
+
+
 def age_pubkey() -> str:
-    """Derive our public key from the identity file."""
+    """Derive our public key from the (possibly session) identity file."""
     need("age-keygen")
+    idf = active_identity(load_config())
     out = subprocess.run(
-        ["age-keygen", "-y", str(IDENTITY_FILE)],
+        ["age-keygen", "-y", str(idf)],
         capture_output=True, text=True,
     )
     if out.returncode != 0:
@@ -241,10 +311,11 @@ def decrypt_vault(cfg: dict) -> dict:
     if not vf.exists():
         return {"secrets": {}}
     need("age")
-    if not IDENTITY_FILE.exists():
+    idf = active_identity(cfg)            # raises Locked if protected & not unlocked
+    if not idf.exists():
         die("no identity key found. Run `envkeep init`.")
     out = subprocess.run(
-        ["age", "-d", "-i", str(IDENTITY_FILE), str(vf)],
+        ["age", "-d", "-i", str(idf), str(vf)],
         capture_output=True,
     )
     if out.returncode != 0:
@@ -454,12 +525,81 @@ def cmd_get(args):
 
 
 def cmd_lock(args):
-    """Purge every decrypted value from the Keychain (end-of-session / panic)."""
+    """Purge cached secrets and re-lock the passphrase-protected key."""
     cfg = require_config()
-    data = decrypt_vault(cfg)
-    n = sum(1 for name in data["secrets"] if kc_delete(name))
+    n = 0
+    try:
+        data = decrypt_vault(cfg)
+        n = sum(1 for name in data["secrets"] if kc_delete(name))
+    except Locked:
+        pass
+    if key_protected(cfg):
+        clear_session()
     log_access(cfg, "lock", f"{n} cached")
-    print(f"✓ Locked — purged {n} decrypted secret(s) from the Keychain.")
+    msg = f"✓ Locked — purged {n} decrypted secret(s) from the Keychain."
+    if key_protected(cfg):
+        msg += " Vault key re-locked (passphrase required)."
+    print(msg)
+
+
+def cmd_protect_key(args):
+    """Encrypt the age identity at rest with a passphrase."""
+    cfg = require_config()
+    if shutil.which("openssl") is None:
+        die("`openssl` not found.")
+    if key_protected(cfg):
+        die("vault key is already passphrase-protected.")
+    if not IDENTITY_FILE.exists():
+        die("no identity key found. Run `envkeep init` first.")
+    p1 = getpass.getpass("New passphrase for your vault key: ")
+    if len(p1) < 6:
+        die("passphrase too short (minimum 6 characters).")
+    if p1 != getpass.getpass("Confirm passphrase: "):
+        die("passphrases do not match.")
+    if not encrypt_identity(p1):
+        die("encryption failed.")
+    IDENTITY_FILE.unlink()
+    cfg["key_protected"] = True
+    save_config(cfg)
+    start_session(cfg, p1)          # keep the current session working
+    log_access(cfg, "protect-key")
+    print("✓ Vault key encrypted at rest. Unlock per session with `envkeep unlock`")
+    print("  (or in the app). ⚠ There is NO recovery if you forget this passphrase.")
+
+
+def cmd_unprotect_key(args):
+    """Remove passphrase protection (store the identity unencrypted again)."""
+    cfg = require_config()
+    if not key_protected(cfg):
+        die("vault key is not passphrase-protected.")
+    p = getpass.getpass("Passphrase: ")
+    ok, _ = _openssl(["enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "200000",
+                      "-in", str(ENC_IDENTITY), "-out", str(IDENTITY_FILE)], p)
+    if not ok:
+        try:
+            IDENTITY_FILE.unlink()
+        except OSError:
+            pass
+        die("wrong passphrase.")
+    IDENTITY_FILE.chmod(0o600)
+    ENC_IDENTITY.unlink()
+    cfg["key_protected"] = False
+    save_config(cfg)
+    clear_session()
+    log_access(cfg, "unprotect-key")
+    print("✓ Passphrase protection removed.")
+
+
+def cmd_unlock(args):
+    """Unlock the passphrase-protected key for this session."""
+    cfg = require_config()
+    if not key_protected(cfg):
+        info("Vault key isn't passphrase-protected — nothing to unlock.")
+        return
+    if not start_session(cfg, getpass.getpass("Passphrase: ")):
+        die("wrong passphrase.")
+    log_access(cfg, "unlock", "cli")
+    print(f"✓ Unlocked for {cfg.get('unlock_minutes', 15)} minute(s).")
 
 
 def cmd_config(args):
@@ -759,49 +899,59 @@ def cmd_gui(args):
             if not authed(self):
                 self._send(403, json.dumps({"error": "forbidden"}))
                 return
-            if path == "/api/list":
-                data = decrypt_vault(cfg)
-                self._send(200, json.dumps(
-                    {"secrets": sorted(data["secrets"]),
-                     "members": read_recipients(cfg),
-                     "touchid": cfg.get("touchid", False),
-                     "totp": bool(cfg.get("totp")),
-                     "locked": totp_locked(),
-                     "unlock_minutes": cfg.get("unlock_minutes", 15)}))
-                return
-            if path == "/api/reveal":
-                if totp_locked():
-                    self._send(401, json.dumps({"error": "locked", "totp": True}))
-                    return
-                from urllib.parse import parse_qs, urlparse
-                q = parse_qs(urlparse(self.path).query)
-                name = q.get("name", [""])[0]
-                data = decrypt_vault(cfg)
-                log_access(cfg, "reveal", name, "gui")
-                self._send(200, json.dumps(
-                    {"name": name, "value": data["secrets"].get(name)}))
-                return
-            if path == "/api/settings":
-                try:
-                    pub = age_pubkey()
-                except SystemExit:
-                    pub = ""
+            if path == "/api/status":
                 self._send(200, json.dumps({
-                    "cache": cfg.get("cache", "none"),
-                    "autolock": cfg.get("autolock", 15),
-                    "log": cfg.get("log", True),
-                    "touchid": cfg.get("touchid", False),
-                    "totp_enabled": bool(cfg.get("totp")),
-                    "unlock_minutes": cfg.get("unlock_minutes", 15),
-                    "pubkey": pub,
-                    "identity": str(IDENTITY_FILE),
-                    "vault_dir": cfg.get("vault_dir", ""),
-                    "access_log": str(ACCESS_LOG),
-                    "version": __version__,
-                    "members": read_members(cfg),
-                }))
+                    "key_protected": key_protected(cfg),
+                    "key_locked": key_protected(cfg) and not session_valid(),
+                    "totp": bool(cfg.get("totp"))}))
                 return
-            self._send(404, json.dumps({"error": "not found"}))
+            try:
+                if path == "/api/list":
+                    data = decrypt_vault(cfg)
+                    self._send(200, json.dumps(
+                        {"secrets": sorted(data["secrets"]),
+                         "members": read_recipients(cfg),
+                         "touchid": cfg.get("touchid", False),
+                         "totp": bool(cfg.get("totp")),
+                         "locked": totp_locked(),
+                         "unlock_minutes": cfg.get("unlock_minutes", 15)}))
+                    return
+                if path == "/api/reveal":
+                    if totp_locked():
+                        self._send(401, json.dumps({"error": "locked", "totp": True}))
+                        return
+                    from urllib.parse import parse_qs, urlparse
+                    q = parse_qs(urlparse(self.path).query)
+                    name = q.get("name", [""])[0]
+                    data = decrypt_vault(cfg)
+                    log_access(cfg, "reveal", name, "gui")
+                    self._send(200, json.dumps(
+                        {"name": name, "value": data["secrets"].get(name)}))
+                    return
+                if path == "/api/settings":
+                    try:
+                        pub = age_pubkey()
+                    except Exception:
+                        pub = ""
+                    self._send(200, json.dumps({
+                        "cache": cfg.get("cache", "none"),
+                        "autolock": cfg.get("autolock", 15),
+                        "log": cfg.get("log", True),
+                        "touchid": cfg.get("touchid", False),
+                        "totp_enabled": bool(cfg.get("totp")),
+                        "unlock_minutes": cfg.get("unlock_minutes", 15),
+                        "key_protected": key_protected(cfg),
+                        "pubkey": pub,
+                        "identity": str(IDENTITY_FILE),
+                        "vault_dir": cfg.get("vault_dir", ""),
+                        "access_log": str(ACCESS_LOG),
+                        "version": __version__,
+                        "members": read_members(cfg),
+                    }))
+                    return
+                self._send(404, json.dumps({"error": "not found"}))
+            except Locked:
+                self._send(401, json.dumps({"error": "key_locked"}))
 
         def do_POST(self):
             if not authed(self):
@@ -932,7 +1082,55 @@ def cmd_gui(args):
                     self._send(200, json.dumps(
                         {"ok": True, "count": len(data["secrets"])}))
                     return
+                if path == "/api/unlock-key":
+                    if not key_protected(cfg):
+                        self._send(200, json.dumps({"ok": True}))
+                        return
+                    if not start_session(cfg, payload.get("passphrase", "")):
+                        raise ValueError("wrong passphrase")
+                    log_access(cfg, "unlock", "gui")
+                    self._send(200, json.dumps({"ok": True}))
+                    return
+                if path == "/api/protect-key":
+                    if key_protected(cfg):
+                        raise ValueError("already protected")
+                    pw = payload.get("passphrase", "")
+                    if len(pw) < 6:
+                        raise ValueError("passphrase too short (min 6)")
+                    if not IDENTITY_FILE.exists():
+                        raise ValueError("identity not available")
+                    if not encrypt_identity(pw):
+                        raise ValueError("encryption failed")
+                    IDENTITY_FILE.unlink()
+                    cfg["key_protected"] = True
+                    save_config(cfg)
+                    start_session(cfg, pw)
+                    log_access(cfg, "protect-key", "", "gui")
+                    self._send(200, json.dumps({"ok": True}))
+                    return
+                if path == "/api/unprotect-key":
+                    if not key_protected(cfg):
+                        raise ValueError("not protected")
+                    ok, _ = _openssl(["enc", "-d", "-aes-256-cbc", "-pbkdf2",
+                                      "-iter", "200000", "-in", str(ENC_IDENTITY),
+                                      "-out", str(IDENTITY_FILE)], payload.get("passphrase", ""))
+                    if not ok:
+                        try:
+                            IDENTITY_FILE.unlink()
+                        except OSError:
+                            pass
+                        raise ValueError("wrong passphrase")
+                    IDENTITY_FILE.chmod(0o600)
+                    ENC_IDENTITY.unlink()
+                    cfg["key_protected"] = False
+                    save_config(cfg)
+                    clear_session()
+                    log_access(cfg, "unprotect-key", "", "gui")
+                    self._send(200, json.dumps({"ok": True}))
+                    return
                 self._send(404, json.dumps({"error": "not found"}))
+            except Locked:
+                self._send(401, json.dumps({"error": "key_locked"}))
             except Exception as e:  # noqa: BLE001 — surface to GUI
                 self._send(400, json.dumps({"error": str(e)}))
 
@@ -1331,6 +1529,27 @@ INDEX_HTML = r"""<!doctype html>
         </div>
 
         <div class="set-card">
+          <h3>Vault key encryption <span class="set-help" id="keyprot-state"></span></h3>
+          <div id="keyprot-off">
+            <div class="set-help" style="padding:8px 2px">
+              Encrypt your age private key at rest with a passphrase — a stolen key file
+              is then useless. You'll unlock once per session (CLI or app).</div>
+            <div class="set-add">
+              <input id="keyprot-pass" type="password" placeholder="New passphrase (min 6)">
+              <button class="btn primary" id="keyprot-enable">Encrypt key</button>
+            </div>
+          </div>
+          <div id="keyprot-on" hidden>
+            <div class="set-help" style="padding:8px 2px">✓ Vault key is passphrase-encrypted.
+              ⚠ There is no recovery if you forget the passphrase.</div>
+            <div class="set-add">
+              <input id="keyprot-disable-pass" type="password" placeholder="Passphrase to confirm">
+              <button class="btn danger" id="keyprot-disable">Remove protection</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="set-card">
           <h3>Your identity</h3>
           <div class="set-kv"><span>Public key</span><code id="set-pub"></code>
             <button class="btn sm" id="set-copypub">Copy</button></div>
@@ -1388,6 +1607,19 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dialog-actions">
       <button class="btn ghost" id="c_cancel">Cancel</button>
       <button class="btn danger" id="c_ok">Delete</button>
+    </div>
+  </div>
+</div>
+
+<!-- passphrase unlock screen (key-protected vaults) -->
+<div class="overlay" id="keyUnlock" hidden>
+  <div class="dialog">
+    <h2>🔐 Vault locked</h2>
+    <p class="muted">Enter your passphrase to unlock the vault key for this session.</p>
+    <input id="keypass" type="password" placeholder="Passphrase"
+      autocomplete="current-password" style="margin-top:16px">
+    <div class="dialog-actions">
+      <button class="btn primary" id="keyunlock-ok" style="width:100%;justify-content:center">Unlock</button>
     </div>
   </div>
 </div>
@@ -1479,8 +1711,24 @@ async function api(path,opts={}){
   opts.headers=H;
   const r=await fetch(path,opts);
   const j=await r.json();
-  if(!r.ok)throw new Error(j.error||'request failed');
+  if(!r.ok){
+    if(j.error==='key_locked')showKeyUnlock();
+    throw new Error(j.error||'request failed');
+  }
   return j;
+}
+function showKeyUnlock(){if($('#keyUnlock').hidden){$('#keyUnlock').hidden=false;
+  setTimeout(()=>$('#keypass').focus(),30);}}
+async function boot(){
+  try{const st=await api('/api/status');
+    if(st.key_locked){showKeyUnlock();return;}}catch(e){}
+  load();
+}
+async function submitKeyUnlock(){
+  try{await api('/api/unlock-key',{method:'POST',
+    body:JSON.stringify({passphrase:$('#keypass').value})});
+    $('#keypass').value='';$('#keyUnlock').hidden=true;boot();
+  }catch(e){toast(e.message==='key_locked'?'wrong passphrase':e.message);}
 }
 function folderOf(full){const i=full.lastIndexOf('/');return i>=0?full.slice(0,i):'';}
 function keyOf(full){const i=full.lastIndexOf('/');return i>=0?full.slice(i+1):full;}
@@ -1720,6 +1968,10 @@ async function openSettings(){
   $('#totp-off').hidden=j.totp_enabled;
   $('#totp-on').hidden=!j.totp_enabled;
   $('#totp-setup').hidden=true;
+  // vault key encryption
+  $('#keyprot-state').textContent=j.key_protected?'· encrypted':'· off';
+  $('#keyprot-off').hidden=j.key_protected;
+  $('#keyprot-on').hidden=!j.key_protected;
   // identity
   $('#set-pub').textContent=j.pubkey||'(unavailable)';
   $('#set-identity').textContent=j.identity;
@@ -1894,7 +2146,22 @@ document.addEventListener('keydown',e=>{
   else if(e.key==='/'){e.preventDefault();$('#search').focus();}
   else if(e.key==='l'){lock();}
 });
-load();
+// key-unlock screen
+$('#keyunlock-ok').onclick=submitKeyUnlock;
+$('#keypass').addEventListener('keydown',e=>{if(e.key==='Enter')submitKeyUnlock();});
+$('#keyprot-enable').onclick=async()=>{
+  const pw=$('#keyprot-pass').value;
+  if(pw.length<6){toast('Passphrase too short (min 6)');return;}
+  try{await api('/api/protect-key',{method:'POST',body:JSON.stringify({passphrase:pw})});
+    $('#keyprot-pass').value='';toast('Vault key encrypted');openSettings();}catch(e){toast(e.message);}
+};
+$('#keyprot-disable').onclick=async()=>{
+  const pw=$('#keyprot-disable-pass').value;
+  if(!pw){toast('Enter your passphrase to confirm');return;}
+  try{await api('/api/unprotect-key',{method:'POST',body:JSON.stringify({passphrase:pw})});
+    $('#keyprot-disable-pass').value='';toast('Protection removed');openSettings();}catch(e){toast(e.message);}
+};
+boot();
 </script>
 </body></html>
 """
@@ -1922,8 +2189,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("name")
     s.set_defaults(func=cmd_get)
 
-    s = sub.add_parser("lock", help="purge decrypted secrets from the Keychain")
+    s = sub.add_parser("lock", help="purge decrypted secrets / re-lock the key")
     s.set_defaults(func=cmd_lock)
+
+    s = sub.add_parser("protect-key", help="encrypt the vault key with a passphrase")
+    s.set_defaults(func=cmd_protect_key)
+
+    s = sub.add_parser("unprotect-key", help="remove passphrase protection")
+    s.set_defaults(func=cmd_unprotect_key)
+
+    s = sub.add_parser("unlock", help="unlock the passphrase-protected key for this session")
+    s.set_defaults(func=cmd_unlock)
 
     s = sub.add_parser("config", help="view/change settings (cache, autolock, log)")
     s.add_argument("key", nargs="?", choices=["cache", "log", "autolock", "touchid"])
@@ -1985,7 +2261,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main():
     args = build_parser().parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except Locked:
+        die("vault key is locked. Run `envkeep unlock` (or unlock in the app).")
 
 
 if __name__ == "__main__":
