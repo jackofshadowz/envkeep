@@ -913,6 +913,7 @@ def cmd_gui(args):
                          "members": read_recipients(cfg),
                          "touchid": cfg.get("touchid", False),
                          "totp": bool(cfg.get("totp")),
+                         "key_protected": key_protected(cfg),
                          "locked": totp_locked(),
                          "unlock_minutes": cfg.get("unlock_minutes", 15)}))
                     return
@@ -1677,6 +1678,7 @@ let search="";
 let TOUCHID=false;     // require biometric before revealing (native app only)
 let UNLOCK_MIN=15;     // auto-relock window (minutes)
 let bioUntil=0;        // Touch ID session valid until (client ms)
+let GATE_ON=false;     // any protection enabled (passphrase / 2FA / Touch ID)
 async function requireAuth(reason){
   const mh=window.webkit&&window.webkit.messageHandlers;
   if(!TOUCHID||!(mh&&mh.auth))return true;   // off, or running in a plain browser
@@ -1943,14 +1945,20 @@ async function lock(){
     for(const k in revealed)delete revealed[k];
     bioUntil=0;                       // re-require Touch ID
     render();
-    toast('Locked'+(j.count?(' — purged '+j.count+' cached'):''));
-    boot();                           // re-check lock state → show unlock screen if needed
+    if(GATE_ON){
+      toast('Locked'+(j.count?(' — purged '+j.count+' cached'):''));
+      boot();                         // re-check lock state → show unlock screen if needed
+    } else {
+      toast('⚠ Reveals are NOT blocked — enable a gate in Settings (passphrase / 2FA / Touch ID)'
+        +(j.count?('. Purged '+j.count+' cached.'):''));
+    }
   }catch(e){toast(e.message);}
 }
 
 async function load(){
   const j=await api('/api/list');
   SECRETS=j.secrets;MEMBERS=j.members;TOUCHID=!!j.touchid;UNLOCK_MIN=j.unlock_minutes||15;
+  GATE_ON=!!(j.touchid||j.totp||j.key_protected);
   $('#memcount').innerHTML='<svg width="13" height="13" viewBox="0 0 24 24" fill="none" '
     +'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
     +'<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>'
