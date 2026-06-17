@@ -53,7 +53,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
     var window: NSWindow!
     var webView: WKWebView!
     var server: Process?
-    let port = 8782
+    var gotURL = false
+    var serverLog = ""
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenu()
@@ -110,7 +111,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let p = Process()
         p.executableURL = URL(fileURLWithPath: bin)
-        p.arguments = ["gui", "--no-open", "--port", String(port)]
+        // --port 0 = let the OS assign a free port (no collision with stale instances).
+        p.arguments = ["gui", "--no-open", "--port", "0"]
         // Give the server a real PATH so it can find `age` and `security`.
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:\(home)/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -121,14 +123,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
         p.standardError = pipe
         let handle = pipe.fileHandleForReading
 
-        var buffer = ""
         handle.readabilityHandler = { [weak self] h in
+            guard let self = self else { return }
             let data = h.availableData
             guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
-            buffer += chunk
-            if let url = self?.extractURL(buffer) {
+            self.serverLog += chunk
+            if !self.gotURL, let url = self.extractURL(self.serverLog) {
+                self.gotURL = true
                 handle.readabilityHandler = nil
-                DispatchQueue.main.async { self?.webView.load(URLRequest(url: url)) }
+                DispatchQueue.main.async { self.webView.load(URLRequest(url: url)) }
+            }
+        }
+
+        // If the server exits before we got a URL, show the error instead of hanging.
+        p.terminationHandler = { [weak self] proc in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                if !self.gotURL {
+                    let tail = self.serverLog.isEmpty ? "(no output)" : self.serverLog
+                    self.showSplash("Vault server exited (code \(proc.terminationStatus)).<br><br>"
+                        + "<span style='font:12px ui-monospace,monospace'>\(tail)</span><br><br>"
+                        + "Quit and reopen Envkeep.", color: "#ff5b6e")
+                }
             }
         }
 
@@ -138,6 +154,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
         } catch {
             showSplash("Failed to start the vault server:<br>\(error.localizedDescription)",
                        color: "#ff5b6e")
+            return
+        }
+
+        // Watchdog: if no URL within 10s, surface a hint rather than spinning forever.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self = self, !self.gotURL else { return }
+            self.showSplash("The vault server didn't respond in time.<br>Quit and reopen Envkeep.",
+                            color: "#ff5b6e")
         }
     }
 
