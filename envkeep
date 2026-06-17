@@ -33,6 +33,7 @@ import secrets as _stdlib_secrets
 import shlex
 import shutil
 import struct
+import tempfile
 import time
 from datetime import datetime
 import subprocess
@@ -862,6 +863,102 @@ def cmd_pubkey(args):
     print(age_pubkey())
 
 
+def cmd_remove_member(args):
+    """Revoke a member by alias or public key, then re-encrypt for the rest."""
+    cfg = require_config()
+    git_sync_pull(cfg)
+    data = decrypt_vault(cfg)                 # needs the current key (may raise Locked)
+    rf = recipients_file(cfg)
+    if not rf.exists():
+        die("no recipients file.")
+    target = args.who.strip()
+    kept, removed = [], []
+    for line in rf.read_text().splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            kept.append(line)
+            continue
+        alias = s.split("=")[0].strip() if "=" in s else ""
+        key = s.split("=")[-1].strip()
+        if target in (alias, key):
+            removed.append(key)
+        else:
+            kept.append(line)
+    if not removed:
+        die(f"no member matching '{target}'. See `envkeep members`.")
+    if age_pubkey() in removed:
+        die("refusing to remove your own key (you'd lose access). "
+            "Use `envkeep rotate-identity` instead.")
+    rf.write_text("\n".join(kept) + ("\n" if kept else ""))
+    encrypt_vault(cfg, data)
+    git_commit_push(cfg, f"remove member {target}")
+    log_access(cfg, "remove-member", target)
+    print(f"✓ Removed {len(removed)} member(s) and re-encrypted the vault for the rest.")
+    print("  ⚠ Rotate any secrets they knew — they may keep an old plaintext copy.")
+
+
+def cmd_rotate_identity(args):
+    """Generate a fresh vault key, update recipients, and re-encrypt the vault."""
+    cfg = require_config()
+    need("age")
+    need("age-keygen")
+    git_sync_pull(cfg)
+    data = decrypt_vault(cfg)                 # decrypt with the current key first
+    old_pub = age_pubkey()
+    was_protected = key_protected(cfg)
+
+    tmpdir = Path(tempfile.mkdtemp())
+    tmp = tmpdir / "newid.txt"
+    r = subprocess.run(["age-keygen", "-o", str(tmp)], capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"age-keygen failed: {r.stderr.strip()}")
+    new_pub = subprocess.run(["age-keygen", "-y", str(tmp)],
+                             capture_output=True, text=True).stdout.strip()
+
+    # swap our public key in recipients (old -> new)
+    rf = recipients_file(cfg)
+    lines = rf.read_text().splitlines() if rf.exists() else []
+    out, replaced = [], False
+    for line in lines:
+        if old_pub in line:
+            out.append(line.replace(old_pub, new_pub)); replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        out.append(f"{getpass.getuser()} = {new_pub}")
+    rf.write_text("\n".join(out) + "\n")
+
+    # install the new identity (re-protect with a passphrase if it was protected)
+    if was_protected:
+        p1 = getpass.getpass("New passphrase for the rotated key: ")
+        if len(p1) < 6:
+            die("passphrase too short (min 6).")
+        if p1 != getpass.getpass("Confirm passphrase: "):
+            die("passphrases do not match.")
+        shutil.copy(tmp, IDENTITY_FILE)
+        IDENTITY_FILE.chmod(0o600)
+        if not encrypt_identity(p1):
+            die("failed to encrypt the new key.")
+        IDENTITY_FILE.unlink()
+        clear_session()
+        start_session(cfg, p1)
+    else:
+        shutil.copy(tmp, IDENTITY_FILE)
+        IDENTITY_FILE.chmod(0o600)
+    try:
+        tmp.unlink(); tmpdir.rmdir()
+    except OSError:
+        pass
+
+    encrypt_vault(cfg, data)                  # re-encrypt to the updated recipients
+    git_commit_push(cfg, "rotate identity key")
+    log_access(cfg, "rotate-identity")
+    print("✓ Rotated your vault key and re-encrypted the vault.")
+    print(f"  old: {old_pub}")
+    print(f"  new: {new_pub}")
+    print("  If the old key may be compromised, rotate the secret VALUES too.")
+
+
 def cmd_gui(args):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1078,6 +1175,30 @@ def cmd_gui(args):
                     encrypt_vault(cfg, decrypt_vault(cfg))   # re-encrypt for new member
                     git_commit_push(cfg, f"add member {alias or pubkey[:12]} (gui)")
                     log_access(cfg, "add-member", alias or pubkey[:12], "gui")
+                    self._send(200, json.dumps({"ok": True}))
+                    return
+                if path == "/api/remove-member":
+                    who = (payload.get("who") or "").strip()
+                    git_sync_pull(cfg)
+                    data = decrypt_vault(cfg)
+                    rf = recipients_file(cfg)
+                    kept, removed = [], []
+                    for line in (rf.read_text().splitlines() if rf.exists() else []):
+                        s = line.strip()
+                        if not s or s.startswith("#"):
+                            kept.append(line); continue
+                        alias = s.split("=")[0].strip() if "=" in s else ""
+                        key = s.split("=")[-1].strip()
+                        (removed if who in (alias, key) else kept).append(
+                            key if who in (alias, key) else line)
+                    if not removed:
+                        raise ValueError("no such member")
+                    if age_pubkey() in removed:
+                        raise ValueError("can't remove your own key")
+                    rf.write_text("\n".join(kept) + ("\n" if kept else ""))
+                    encrypt_vault(cfg, data)
+                    git_commit_push(cfg, f"remove member {who} (gui)")
+                    log_access(cfg, "remove-member", who, "gui")
                     self._send(200, json.dumps({"ok": True}))
                     return
                 if path == "/api/sync":
@@ -2005,6 +2126,17 @@ async function openSettings(){
     const row=el('div','set-member');
     row.appendChild(el('b',null,m.alias||'member'));
     row.appendChild(el('code',null,m.key));
+    if(m.key===j.pubkey){
+      row.appendChild(el('span','set-help','(you)'));
+    } else {
+      const rm=el('button','iconbtn danger');rm.title='Remove member';rm.innerHTML=ICON.trash;
+      rm.onclick=async()=>{
+        if(!confirm('Remove '+(m.alias||'this member')+' and re-encrypt the vault?'))return;
+        try{await api('/api/remove-member',{method:'POST',body:JSON.stringify({who:m.key})});
+          toast('Member removed');openSettings();}catch(e){toast(e.message);}
+      };
+      row.appendChild(rm);
+    }
     mm.appendChild(row);
   });
 }
@@ -2265,6 +2397,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("alias")
     s.add_argument("pubkey")
     s.set_defaults(func=cmd_add_member)
+
+    s = sub.add_parser("remove-member", help="revoke a member (alias or age1… key)")
+    s.add_argument("who")
+    s.set_defaults(func=cmd_remove_member)
+
+    s = sub.add_parser("rotate-identity", help="generate a new vault key + re-encrypt")
+    s.set_defaults(func=cmd_rotate_identity)
 
     s = sub.add_parser("pubkey", help="print your age public key")
     s.set_defaults(func=cmd_pubkey)

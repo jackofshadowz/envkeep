@@ -116,6 +116,8 @@ envkeep env  my-app [--dotenv]           # export lines (or .env format)
 envkeep import ./path [--apply]          # scan .env files (dry-run by default)
 envkeep rm   my-app/STRIPE_KEY
 envkeep pubkey | members | add-member alice age1…
+envkeep remove-member alice              # revoke a member + re-encrypt
+envkeep rotate-identity                  # new vault key + re-encrypt (key rotation)
 envkeep gui                              # the same UI in your browser
 
 # security
@@ -138,6 +140,11 @@ GUI shortcuts: **⌘K** palette · **n** new · **/** search · **l** lock · **
 1. A teammate runs `envkeep init` and sends you `envkeep pubkey` → `age1…`.
 2. You run `envkeep add-member alice age1…` (re-encrypts the vault for everyone).
 3. They point their vault dir at the shared private repo. `envkeep members` lists access.
+
+**Revoking & rotating:** `envkeep remove-member alice` (or the × in Settings → Team)
+re-encrypts the vault for everyone who remains. `envkeep rotate-identity` issues you a
+brand-new key and re-encrypts — use it if your key may be exposed. After either, rotate
+the secret *values* a departed member knew.
 
 ## 🔒 Security
 
