@@ -988,8 +988,14 @@ def cmd_gui(args):
                     self._send(200, json.dumps({"ok": True}))
                     return
                 if path == "/api/lock":
-                    data = decrypt_vault(cfg)
-                    n = sum(1 for nm in data["secrets"] if kc_delete(nm))
+                    n = 0
+                    try:
+                        data = decrypt_vault(cfg)
+                        n = sum(1 for nm in data["secrets"] if kc_delete(nm))
+                    except Locked:
+                        pass
+                    clear_session()                      # re-lock the passphrase key
+                    state["totp_unlocked_until"] = 0.0    # re-require a 2FA code
                     log_access(cfg, "lock", f"{n} cached", "gui")
                     self._send(200, json.dumps({"ok": True, "count": n}))
                     return
@@ -1933,8 +1939,12 @@ async function sync(){
 }
 async function lock(){
   try{const j=await api('/api/lock',{method:'POST',body:'{}'});
-    for(const k in revealed)delete revealed[k];render();
-    toast('Locked — purged '+j.count+' cached secret'+(j.count===1?'':'s'));}catch(e){toast(e.message);}
+    for(const k in revealed)delete revealed[k];
+    bioUntil=0;                       // re-require Touch ID
+    render();
+    toast('Locked'+(j.count?(' — purged '+j.count+' cached'):''));
+    boot();                           // re-check lock state → show unlock screen if needed
+  }catch(e){toast(e.message);}
 }
 
 async function load(){
