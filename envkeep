@@ -1484,6 +1484,9 @@ async function api(path,opts={}){
 }
 function folderOf(full){const i=full.lastIndexOf('/');return i>=0?full.slice(0,i):'';}
 function keyOf(full){const i=full.lastIndexOf('/');return i>=0?full.slice(i+1):full;}
+function envName(full){return keyOf(full).toUpperCase().replace(/[^A-Z0-9]/g,'_');}
+// What a coding agent should run: assign the secret to an env var, on demand.
+function getCmd(full){return 'export '+envName(full)+'="$(envkeep get '+full+')"';}
 
 function toast(msg,cmd){
   const t=$('#toast');
@@ -1602,9 +1605,9 @@ function render(){
 
     const tdAct=el('td','ta-r');
     const acts=el('div','row-actions');
-    const bCmd=el('button','iconbtn');bCmd.title='Copy command (envkeep get '+full+')';
+    const bCmd=el('button','iconbtn');bCmd.title='Copy command — '+getCmd(full);
     bCmd.innerHTML=ICON.term;
-    bCmd.onclick=()=>writeClip('envkeep get '+full,'Copied command','envkeep get '+full);
+    bCmd.onclick=()=>writeClip(getCmd(full),'Copied command for '+keyOf(full),getCmd(full));
     const bCopy=el('button','iconbtn');bCopy.title='Copy value';bCopy.innerHTML=ICON.copy;
     bCopy.onclick=async()=>{
       if(!await requireAuth('copy '+keyOf(full))){toast('Authentication required');return;}
@@ -1767,8 +1770,8 @@ function buildCommands(){
     c.push({k:'env',ic:'$',label:'Copy env cmd: '+f,sub:'envkeep env '+f,
       run:()=>writeClip('envkeep env '+f,'Copied command','envkeep env '+f)}));
   SECRETS.slice().sort().forEach(full=>{
-    c.push({k:'cmd',ic:'>',label:'Copy command: '+full,sub:'envkeep get '+full,
-      run:()=>writeClip('envkeep get '+full,'Copied command','envkeep get '+full)});
+    c.push({k:'cmd',ic:'>',label:'Copy command: '+full,sub:getCmd(full),
+      run:()=>writeClip(getCmd(full),'Copied command for '+keyOf(full),getCmd(full))});
     c.push({k:'value',ic:'*',label:'Copy value: '+full,
       run:async()=>{try{const j=await apiReveal(full);
         writeClip(j.value,'Copied value of '+keyOf(full),null,true);}catch(e){toast(e.message);}}});
