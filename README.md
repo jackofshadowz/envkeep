@@ -12,6 +12,7 @@
 ![Encryption: age](https://img.shields.io/badge/encryption-age-16341d.svg)
 ![pip deps: 0](https://img.shields.io/badge/pip%20deps-0-2ea043.svg)
 ![PRs welcome](https://img.shields.io/badge/PRs-welcome-7fee64.svg)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-%E2%98%95-ffdd00.svg)](https://buymeacoffee.com/jackcodes)
 
 <br/>
 
@@ -188,6 +189,11 @@ One-click presets in Settings:
 ## 📦 Requirements
 
 macOS · `age` + `age-keygen` (`brew install age`) · Python 3 (system Python is fine) · `openssl` (ships with macOS; used for passphrase key encryption) · Xcode CLT (`swiftc`) for the native app.
+
+## ☕ Support
+
+If Envkeep saves you from leaking another API key, you can
+[buy me a coffee](https://buymeacoffee.com/jackcodes).
 
 ## 📄 License
 
