@@ -485,6 +485,54 @@ def cmd_init(args):
     print("  • Make the vault dir a private git repo for team sync (auto_git is on).")
 
 
+# --- secret entries -------------------------------------------------------
+# A vault secret is EITHER a plain string (legacy / simple) OR an enriched
+# object {"value": str, "notes": str, "fields": {KEY: str}}. These helpers let
+# every consumer treat the two shapes uniformly; an entry only "upgrades" to an
+# object when notes/fields are actually attached, so existing vaults are
+# untouched and the `get`/`env` contract (one raw value) never changes.
+
+def secret_value(entry) -> str:
+    """The primary secret string, whatever the entry's shape."""
+    return entry.get("value", "") if isinstance(entry, dict) else (entry or "")
+
+
+def secret_notes(entry) -> str:
+    return entry.get("notes", "") if isinstance(entry, dict) else ""
+
+
+def secret_fields(entry) -> dict:
+    return dict(entry.get("fields", {})) if isinstance(entry, dict) else {}
+
+
+def set_primary_value(entry, value: str):
+    """Return `entry` with its primary value replaced, preserving notes/fields.
+    Stays a bare string when there was no metadata."""
+    if isinstance(entry, dict):
+        out = dict(entry)
+        out["value"] = value
+        return out
+    return value
+
+
+def with_meta(entry, notes=None, fields=None):
+    """Attach/replace notes and/or fields. Pass None to leave that part as-is.
+    Collapses back to a plain string when no metadata remains."""
+    value = secret_value(entry)
+    n = (secret_notes(entry) if notes is None else notes) or ""
+    n = n.strip()
+    f = secret_fields(entry) if fields is None else dict(fields)
+    f = {k: v for k, v in f.items() if k}          # drop blank keys
+    if not n and not f:
+        return value                               # collapse to plain string
+    out = {"value": value}
+    if n:
+        out["notes"] = n
+    if f:
+        out["fields"] = f
+    return out
+
+
 def cmd_sync(args):
     cfg = require_config()
     if not cache_enabled(cfg):
@@ -495,7 +543,7 @@ def cmd_sync(args):
     data = decrypt_vault(cfg)
     n = 0
     for name, value in data["secrets"].items():
-        kc_set(name, value)
+        kc_set(name, secret_value(value))
         n += 1
     print(f"✓ Synced {n} secret(s) from the vault into your Keychain.")
 
@@ -508,16 +556,16 @@ def cmd_get(args):
         val = kc_get(args.name)
         if val is None:
             data = decrypt_vault(cfg)
-            val = data["secrets"].get(args.name)
-            if val is None:
+            if args.name not in data["secrets"]:
                 die(f"no secret named '{args.name}'. Try `envkeep list`.")
+            val = secret_value(data["secrets"][args.name])
             kc_set(args.name, val)
     else:
         # Decrypt-on-demand: no plaintext is ever persisted to the Keychain.
         data = decrypt_vault(cfg)
-        val = data["secrets"].get(args.name)
-        if val is None:
+        if args.name not in data["secrets"]:
             die(f"no secret named '{args.name}'. Try `envkeep list`.")
+        val = secret_value(data["secrets"][args.name])
     log_access(cfg, "get", args.name)
     # raw value to stdout, no trailing decoration → safe for $(...) capture
     sys.stdout.write(val)
@@ -699,7 +747,7 @@ def cmd_env(args):
     cfg = require_config()
     data = decrypt_vault(cfg)
     pfx = args.prefix.strip("/") + "/"
-    items = [(n[len(pfx):], v) for n, v in sorted(data["secrets"].items())
+    items = [(n[len(pfx):], secret_value(v)) for n, v in sorted(data["secrets"].items())
              if n.startswith(pfx)]
     if not items:
         die(f"no secrets under '{args.prefix}'. Try `envkeep folders`.")
@@ -788,7 +836,7 @@ def cmd_import(args):
         full = f"{project}/{k}"
         if full in existing and not args.overwrite:
             continue
-        data["secrets"][full] = v
+        data["secrets"][full] = set_primary_value(data["secrets"].get(full), v)
         if cache_enabled(cfg):
             kc_set(full, v)
         n += 1
@@ -809,7 +857,8 @@ def cmd_set(args):
         die("empty value — aborting.")
     data = decrypt_vault(cfg)
     existed = args.name in data["secrets"]
-    data["secrets"][args.name] = value
+    # preserve any notes/fields already attached to this secret
+    data["secrets"][args.name] = set_primary_value(data["secrets"].get(args.name), value)
     encrypt_vault(cfg, data)
     if cache_enabled(cfg):
         kc_set(args.name, value)
@@ -830,6 +879,86 @@ def cmd_rm(args):
     git_commit_push(cfg, f"remove {args.name}")
     log_access(cfg, "remove", args.name)
     print(f"✓ Removed {args.name}")
+
+
+def cmd_note(args):
+    """Show, set, or clear a secret's note (freeform metadata, never exported)."""
+    cfg = require_config()
+    writing = args.clear or args.text is not None
+    if writing:
+        git_sync_pull(cfg)
+    data = decrypt_vault(cfg)
+    if args.name not in data["secrets"]:
+        die(f"no secret named '{args.name}'. Try `envkeep list`.")
+    entry = data["secrets"][args.name]
+    if not writing:
+        cur = secret_notes(entry)
+        print(cur if cur else "(no note)")
+        return
+    data["secrets"][args.name] = with_meta(entry, notes="" if args.clear else args.text)
+    encrypt_vault(cfg, data)
+    git_commit_push(cfg, f"{'clear note on' if args.clear else 'note on'} {args.name}")
+    log_access(cfg, "note", args.name)
+    print(f"✓ {'Cleared' if args.clear else 'Set'} note on {args.name}")
+
+
+def cmd_field(args):
+    """Add, read, list, or remove a secret's extra fields (e.g. USERNAME, URL).
+
+    Fields are metadata stored alongside the secret — they are NOT injected by
+    `envkeep env` and the access log records names only, never values.
+
+        envkeep field app/LOGIN                 # list field names
+        envkeep field app/LOGIN USERNAME        # print one field's value
+        envkeep field app/LOGIN USERNAME=ops@x  # set a field
+        envkeep field app/LOGIN USERNAME --rm   # remove a field
+    """
+    cfg = require_config()
+    spec = args.spec
+    mutate = spec is not None and ("=" in spec or args.rm)
+    if mutate:
+        git_sync_pull(cfg)
+    data = decrypt_vault(cfg)
+    if args.name not in data["secrets"]:
+        die(f"no secret named '{args.name}'. Try `envkeep list`.")
+    entry = data["secrets"][args.name]
+    fields = secret_fields(entry)
+
+    if spec is None:                              # list field names
+        if not fields:
+            info("(no extra fields)")
+            return
+        for k in sorted(fields):
+            print(k)
+        return
+
+    if "=" in spec:                               # set
+        key, val = spec.split("=", 1)
+        key = key.strip()
+        if not key:
+            die("field key is empty.")
+        fields[key] = val
+        action = f"set field {key}"
+    elif args.rm:                                 # remove
+        key = spec.strip()
+        if key not in fields:
+            die(f"no field '{key}' on {args.name}.")
+        del fields[key]
+        action = f"remove field {key}"
+    else:                                         # read one field's value
+        key = spec.strip()
+        if key not in fields:
+            die(f"no field '{key}' on {args.name}. Try `envkeep field {args.name}`.")
+        sys.stdout.write(fields[key])
+        if sys.stdout.isatty():
+            sys.stdout.write("\n")
+        return
+
+    data["secrets"][args.name] = with_meta(entry, fields=fields)
+    encrypt_vault(cfg, data)
+    git_commit_push(cfg, f"{action} on {args.name}")
+    log_access(cfg, "field", args.name)
+    print(f"✓ {action[0].upper() + action[1:]} on {args.name}")
 
 
 def cmd_members(args):
@@ -1022,9 +1151,13 @@ def cmd_gui(args):
                     q = parse_qs(urlparse(self.path).query)
                     name = q.get("name", [""])[0]
                     data = decrypt_vault(cfg)
+                    entry = data["secrets"].get(name)
                     log_access(cfg, "reveal", name, "gui")
                     self._send(200, json.dumps(
-                        {"name": name, "value": data["secrets"].get(name)}))
+                        {"name": name,
+                         "value": secret_value(entry),
+                         "notes": secret_notes(entry),
+                         "fields": secret_fields(entry)}))
                     return
                 if path == "/api/settings":
                     try:
@@ -1066,7 +1199,12 @@ def cmd_gui(args):
                     git_sync_pull(cfg)
                     data = decrypt_vault(cfg)
                     existed = name in data["secrets"]
-                    data["secrets"][name] = value
+                    entry = set_primary_value(data["secrets"].get(name), value)
+                    # the GUI explicitly manages metadata; apply it when sent
+                    notes, fields = payload.get("notes"), payload.get("fields")
+                    if notes is not None or fields is not None:
+                        entry = with_meta(entry, notes=notes, fields=fields)
+                    data["secrets"][name] = entry
                     encrypt_vault(cfg, data)
                     if cache_enabled(cfg):
                         kc_set(name, value)
@@ -1206,7 +1344,7 @@ def cmd_gui(args):
                     data = decrypt_vault(cfg)
                     if cache_enabled(cfg):
                         for n, v in data["secrets"].items():
-                            kc_set(n, v)
+                            kc_set(n, secret_value(v))
                     self._send(200, json.dumps(
                         {"ok": True, "count": len(data["secrets"])}))
                     return
@@ -1719,6 +1857,12 @@ INDEX_HTML = r"""<!doctype html>
     <input id="m_name" placeholder="OPENAI_API_KEY" autocomplete="off">
     <label>Value</label>
     <textarea id="m_value" placeholder="sk-..." autocomplete="off" spellcheck="false"></textarea>
+    <label>Notes <span class="muted">(optional — never injected into env)</span></label>
+    <textarea id="m_notes" placeholder="rotate quarterly; owned by #payments"
+      autocomplete="off" spellcheck="false" style="min-height:54px"></textarea>
+    <label>Extra fields <span class="muted">(optional — one KEY=VALUE per line)</span></label>
+    <textarea id="m_fields" placeholder="USERNAME=ops@acme.io&#10;URL=https://dash.stripe.com"
+      autocomplete="off" spellcheck="false" style="min-height:54px"></textarea>
     <div class="hint">Saving encrypts the vault for every member and (if it is a git repo)
       commits &amp; pushes automatically.</div>
     <div class="dialog-actions">
@@ -2010,7 +2154,8 @@ async function openModal(edit){
   const dl=$('#folderlist');dl.innerHTML='';
   Object.keys(folders()).filter(f=>f!=='').sort().forEach(f=>{
     const o=document.createElement('option');o.value=f;dl.appendChild(o);});
-  const fF=$('#m_folder'),fN=$('#m_name'),fV=$('#m_value');
+  const fF=$('#m_folder'),fN=$('#m_name'),fV=$('#m_value'),fNo=$('#m_notes'),fFi=$('#m_fields');
+  fNo.value='';fFi.value='';
   if(editing){
     $('#modalTitle').textContent='Edit secret';
     $('#m_save').textContent='Update secret';
@@ -2018,7 +2163,8 @@ async function openModal(edit){
     fF.disabled=true;fN.disabled=true;            // identity locked while editing
     fV.value='';fV.placeholder='Enter a new value...';
     $('#modal').hidden=false;
-    try{const j=await apiReveal(editing);fV.value=j.value;}catch(e){}
+    try{const j=await apiReveal(editing);fV.value=j.value;
+      fNo.value=j.notes||'';fFi.value=fieldsToText(j.fields);}catch(e){}
     setTimeout(()=>fV.focus(),30);
   } else {
     $('#modalTitle').textContent='New secret';
@@ -2028,6 +2174,10 @@ async function openModal(edit){
     $('#modal').hidden=false;setTimeout(()=>fN.focus(),30);
   }
 }
+function fieldsToText(o){return Object.keys(o||{}).map(k=>k+'='+o[k]).join('\n');}
+function parseFields(text){const o={};(text||'').split('\n').forEach(line=>{
+  line=line.trim();if(!line)return;const i=line.indexOf('=');if(i<0)return;
+  const k=line.slice(0,i).trim();if(k)o[k]=line.slice(i+1);});return o;}
 function closeModal(){$('#modal').hidden=true;editing=null;
   $('#m_folder').disabled=false;$('#m_name').disabled=false;}
 async function saveModal(){
@@ -2036,7 +2186,9 @@ async function saveModal(){
   const v=$('#m_value').value;
   if(!n||v===''){toast('Name and value are required');return;}
   const full=editing?editing:(f?f+'/'+n:n);
-  try{await api('/api/set',{method:'POST',body:JSON.stringify({name:full,value:v})});
+  const notes=$('#m_notes').value;const fields=parseFields($('#m_fields').value);
+  try{await api('/api/set',{method:'POST',
+      body:JSON.stringify({name:full,value:v,notes:notes,fields:fields})});
     const wasEditing=!!editing;closeModal();
     delete revealed[full];
     toast((wasEditing?'Updated ':'Saved ')+keyOf(full));await load();
@@ -2389,6 +2541,19 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("rm", help="remove a secret")
     s.add_argument("name")
     s.set_defaults(func=cmd_rm)
+
+    s = sub.add_parser("note", help="show/set/clear a secret's note (metadata)")
+    s.add_argument("name")
+    s.add_argument("text", nargs="?", help="note text (omit to show the current note)")
+    s.add_argument("--clear", action="store_true", help="remove the note")
+    s.set_defaults(func=cmd_note)
+
+    s = sub.add_parser("field", help="add/read/list/remove extra fields on a secret")
+    s.add_argument("name")
+    s.add_argument("spec", nargs="?",
+                   help="KEY=VALUE to set, KEY to read, or omit to list field names")
+    s.add_argument("--rm", action="store_true", help="remove the field named KEY")
+    s.set_defaults(func=cmd_field)
 
     s = sub.add_parser("members", help="show who can read the vault")
     s.set_defaults(func=cmd_members)
