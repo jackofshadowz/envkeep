@@ -28,6 +28,12 @@ So you can just tell your coding agent:
 
 …and it runs `envkeep get my-app/OPENAI_API_KEY`, pulling exactly one value on demand. No secret pasted into chat, no `.env` lying around, nothing in plaintext at rest.
 
+**Use it with your AI agent:** [Claude Code](docs/guides/claude-code.md) · [Cursor](docs/guides/cursor.md) · [aider](docs/guides/aider.md)
+
+<div align="center">
+<img src="docs/demo.gif" width="760" alt="Envkeep CLI demo: get one value, load a project, notes & fields, audit log" />
+</div>
+
 ## ✨ Features
 
 | | |
