@@ -11,8 +11,8 @@ Require envkeep
 
 Set Shell "bash"
 Set FontSize 20
-Set Width 1180
-Set Height 660
+Set Width 1280
+Set Height 600
 Set Padding 26
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 45ms
@@ -25,21 +25,22 @@ Type "clear" Enter
 Show
 
 Sleep 700ms
-Type "# you tell your agent: “the key is in envkeep — grab my-app/OPENAI_API_KEY”" Sleep 500ms Enter
-Sleep 400ms
+Type "# your agent grabs one value, on demand" Sleep 450ms Enter
+Sleep 350ms
 Type "envkeep get my-app/OPENAI_API_KEY" Sleep 350ms Enter
 Sleep 1300ms
 
-Type "# load a whole project into the shell — nothing written to disk" Enter
-Type `eval "$(envkeep env my-app)" && env | grep -E "OPENAI|STRIPE|DATABASE"` Sleep 300ms Enter
-Sleep 1600ms
+Type "# load a whole project into the shell" Enter
+Type `eval "$(envkeep env my-app)"` Sleep 300ms Enter
+Type "printenv STRIPE_KEY DATABASE_URL" Sleep 300ms Enter
+Sleep 1500ms
 
-Type "# notes & extra fields ride along with a secret (metadata, never injected)" Enter
+Type "# notes & extra fields ride along with it" Enter
 Type "envkeep note my-app/STRIPE_KEY" Sleep 250ms Enter
-Sleep 1100ms
+Sleep 1000ms
 Type "envkeep field my-app/STRIPE_KEY" Sleep 250ms Enter
-Sleep 1600ms
+Sleep 1500ms
 
-Type "# the audit log records names only — never values" Enter
+Type "# the audit log keeps names, never values" Enter
 Type "envkeep log --tail 4" Sleep 250ms Enter
 Sleep 2600ms
