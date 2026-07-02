@@ -42,6 +42,7 @@ So you can just tell your coding agent:
 | 🖥️ **Native macOS app** | A real Swift / WKWebView window (not a browser tab) with its own Dock icon and menus. |
 | ⌨️ **CLI for agents** | `envkeep get NAME` prints one value; `envkeep env project` loads a whole project. |
 | 🗂️ **Projects & folders** | Organise secrets as `project/KEY`; the GUI groups them, the CLI dumps them. |
+| 🏷️ **Tags** | Label secrets (`prod`, `db`, …) across projects; filter by tag in the app or `envkeep list --tag prod`. |
 | 🧭 **Command palette** | ⌘K to jump to any project, secret, or action. Plus `n`, `/`, `l` shortcuts. |
 | ⛔ **Decrypt-on-demand** | No plaintext cache by default; optional Keychain cache + one-click **Lock**. |
 | 📥 **Import** | `envkeep import ./my-app` scans `.env` files and pulls them in (dry-run first). |
@@ -117,11 +118,17 @@ eval "$(envkeep env my-app)"           # load the whole project into your shell
 ```bash
 envkeep set  my-app/STRIPE_KEY [value]   # add / update (hidden prompt if omitted)
 envkeep get  my-app/STRIPE_KEY           # print one value
-envkeep list [project]                   # names only
+envkeep list [project] [--tag prod]      # names only (filter by tag, repeatable)
 envkeep folders                          # list projects
 envkeep env  my-app [--dotenv]           # export lines (or .env format)
 envkeep import ./path [--apply]          # scan .env files (dry-run by default)
 envkeep rm   my-app/STRIPE_KEY
+
+# metadata (stored with the secret, never injected by `env`)
+envkeep note  my-app/STRIPE_KEY [text]   # show / set / --clear a note
+envkeep field my-app/LOGIN [KEY=VAL]     # extra fields (USERNAME, URL, …)
+envkeep tag   my-app/STRIPE_KEY prod db  # add tags (--rm x, --clear, omit to list)
+envkeep tags                             # every tag in the vault, with counts
 envkeep pubkey | members | add-member alice age1…
 envkeep remove-member alice              # revoke a member + re-encrypt
 envkeep rotate-identity                  # new vault key + re-encrypt (key rotation)

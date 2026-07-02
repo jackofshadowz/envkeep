@@ -505,6 +505,20 @@ def secret_fields(entry) -> dict:
     return dict(entry.get("fields", {})) if isinstance(entry, dict) else {}
 
 
+def secret_tags(entry) -> list:
+    """The entry's tags as a sorted, de-duplicated list (empty for bare strings)."""
+    if not isinstance(entry, dict):
+        return []
+    return sorted({norm_tag(t) for t in entry.get("tags", []) if norm_tag(t)})
+
+
+def norm_tag(tag: str) -> str:
+    """Canonical form of a tag: trimmed, lower-cased, inner runs of whitespace
+    collapsed to a single '-'. Returns '' for anything that isn't a usable tag."""
+    t = " ".join((tag or "").split()).strip().lower().replace(" ", "-")
+    return t
+
+
 def set_primary_value(entry, value: str):
     """Return `entry` with its primary value replaced, preserving notes/fields.
     Stays a bare string when there was no metadata."""
@@ -515,21 +529,25 @@ def set_primary_value(entry, value: str):
     return value
 
 
-def with_meta(entry, notes=None, fields=None):
-    """Attach/replace notes and/or fields. Pass None to leave that part as-is.
-    Collapses back to a plain string when no metadata remains."""
+def with_meta(entry, notes=None, fields=None, tags=None):
+    """Attach/replace notes, fields and/or tags. Pass None to leave that part
+    as-is. Collapses back to a plain string when no metadata remains."""
     value = secret_value(entry)
     n = (secret_notes(entry) if notes is None else notes) or ""
     n = n.strip()
     f = secret_fields(entry) if fields is None else dict(fields)
     f = {k: v for k, v in f.items() if k}          # drop blank keys
-    if not n and not f:
+    t = secret_tags(entry) if tags is None else tags
+    t = sorted({norm_tag(x) for x in t if norm_tag(x)})   # normalise + de-dupe
+    if not n and not f and not t:
         return value                               # collapse to plain string
     out = {"value": value}
     if n:
         out["notes"] = n
     if f:
         out["fields"] = f
+    if t:
+        out["tags"] = t
     return out
 
 
@@ -718,8 +736,15 @@ def cmd_list(args):
     if prefix:
         pfx = prefix.strip("/") + "/"
         names = [n for n in names if n.startswith(pfx)]
+    # --tag may be repeated and/or comma-separated; a secret must carry ALL of
+    # the requested tags to match (narrowing filter).
+    want = {norm_tag(t) for raw in (getattr(args, "tag", None) or [])
+            for t in raw.split(",") if norm_tag(t)}
+    if want:
+        names = [n for n in names if want <= set(secret_tags(data["secrets"][n]))]
+    filtered = prefix or want
     if not names:
-        info("(no matching secrets)" if prefix else "(vault is empty)")
+        info("(no matching secrets)" if filtered else "(vault is empty)")
         return
     for n in names:
         print(n)
@@ -961,6 +986,74 @@ def cmd_field(args):
     print(f"✓ {action[0].upper() + action[1:]} on {args.name}")
 
 
+def cmd_tag(args):
+    """Show, add, or remove a secret's tags (labels used to group & filter).
+
+    Tags are metadata — like notes/fields they are stored with the secret but
+    are NEVER injected by `envkeep env`, and the access log records names only.
+
+        envkeep tag app/DB_URL                  # list this secret's tags
+        envkeep tag app/DB_URL prod db          # add 'prod' and 'db'
+        envkeep tag app/DB_URL --rm db          # remove 'db'
+        envkeep tag app/DB_URL --clear          # remove every tag
+    """
+    cfg = require_config()
+    # tokens may be space- or comma-separated: "prod,db" == "prod db"
+    add = {norm_tag(t) for raw in (args.tags or []) for t in raw.split(",") if norm_tag(t)}
+    rm = {norm_tag(t) for raw in (args.rm or []) for t in raw.split(",") if norm_tag(t)}
+    writing = bool(add) or bool(rm) or args.clear
+    if writing:
+        git_sync_pull(cfg)
+    data = decrypt_vault(cfg)
+    if args.name not in data["secrets"]:
+        die(f"no secret named '{args.name}'. Try `envkeep list`.")
+    entry = data["secrets"][args.name]
+    tags = set(secret_tags(entry))
+
+    if not writing:                               # list current tags
+        if not tags:
+            info("(no tags)")
+            return
+        for t in sorted(tags):
+            print(t)
+        return
+
+    new = tags | add
+    new -= (set(tags) if args.clear else set())   # --clear drops everything first
+    new -= rm
+    if new == tags:
+        info("(no change)")
+        return
+    data["secrets"][args.name] = with_meta(entry, tags=sorted(new))
+    encrypt_vault(cfg, data)
+    git_commit_push(cfg, f"tag {args.name}")
+    log_access(cfg, "tag", args.name)
+    added = sorted(new - tags)
+    removed = sorted(tags - new)
+    bits = []
+    if added:
+        bits.append("+" + ", +".join(added))
+    if removed:
+        bits.append("-" + ", -".join(removed))
+    print(f"✓ Tags on {args.name}: {'; '.join(bits)}")
+
+
+def cmd_tags(args):
+    """List every tag used across the vault, with how many secrets carry it."""
+    cfg = require_config()
+    data = decrypt_vault(cfg)
+    counts = {}
+    for entry in data["secrets"].values():
+        for t in secret_tags(entry):
+            counts[t] = counts.get(t, 0) + 1
+    if not counts:
+        info("(no tags yet — add one with `envkeep tag NAME <tag>`)")
+        return
+    width = max(len(t) for t in counts)
+    for t in sorted(counts):
+        print(f"{t.ljust(width)}  {counts[t]}")
+
+
 def cmd_members(args):
     cfg = require_config()
     rf = recipients_file(cfg)
@@ -1136,6 +1229,7 @@ def cmd_gui(args):
                     data = decrypt_vault(cfg)
                     self._send(200, json.dumps(
                         {"secrets": sorted(data["secrets"]),
+                         "tags": {n: secret_tags(v) for n, v in data["secrets"].items()},
                          "members": read_recipients(cfg),
                          "touchid": cfg.get("touchid", False),
                          "totp": bool(cfg.get("totp")),
@@ -1157,7 +1251,8 @@ def cmd_gui(args):
                         {"name": name,
                          "value": secret_value(entry),
                          "notes": secret_notes(entry),
-                         "fields": secret_fields(entry)}))
+                         "fields": secret_fields(entry),
+                         "tags": secret_tags(entry)}))
                     return
                 if path == "/api/settings":
                     try:
@@ -1202,8 +1297,9 @@ def cmd_gui(args):
                     entry = set_primary_value(data["secrets"].get(name), value)
                     # the GUI explicitly manages metadata; apply it when sent
                     notes, fields = payload.get("notes"), payload.get("fields")
-                    if notes is not None or fields is not None:
-                        entry = with_meta(entry, notes=notes, fields=fields)
+                    tags = payload.get("tags")
+                    if notes is not None or fields is not None or tags is not None:
+                        entry = with_meta(entry, notes=notes, fields=fields, tags=tags)
                     data["secrets"][name] = entry
                     encrypt_vault(cfg, data)
                     if cache_enabled(cfg):
@@ -1535,6 +1631,28 @@ INDEX_HTML = r"""<!doctype html>
   .tag{display:inline-block;margin-top:4px;font-family:var(--mono);font-size:11px;
        color:var(--muted);background:#f2f2f1;border:1px solid var(--line);
        padding:1px 7px;border-radius:6px}
+  .ttags{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+  .ttag{font-family:var(--mono);font-size:10.5px;color:var(--green-deep);
+       background:var(--green-tint);border:1px solid var(--green-line);
+       padding:1px 7px;border-radius:6px;cursor:pointer;transition:filter .1s}
+  .ttag:hover{filter:brightness(.97)}
+  .ttag::before{content:"#";opacity:.5}
+  /* ---------- tag filter bar ---------- */
+  .tagbar{display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding:10px 26px;
+       border-bottom:1px solid var(--line);background:var(--panel)}
+  .tagbar[hidden]{display:none}
+  .tagbar .tb-lbl{font-size:11px;font-weight:600;letter-spacing:.05em;
+       text-transform:uppercase;color:var(--muted-2);margin-right:2px}
+  .tagbar .chip{font-family:var(--mono);font-size:11.5px;color:var(--muted);
+       background:#f2f2f1;border:1px solid var(--line);padding:2px 9px;border-radius:20px;
+       cursor:pointer;transition:background .12s,color .12s,border-color .12s}
+  .tagbar .chip:hover{border-color:var(--green-line)}
+  .tagbar .chip .ct{opacity:.5;font-variant-numeric:tabular-nums;margin-left:4px}
+  .tagbar .chip.on{color:var(--green-deep);background:var(--green-tint);
+       border-color:var(--green-line)}
+  .tagbar .tb-clear{margin-left:auto;font-size:12px;color:var(--muted-2);
+       background:none;border:none;cursor:pointer}
+  .tagbar .tb-clear:hover{color:var(--ink)}
   .val{display:flex;align-items:center;gap:8px;min-width:0}
   .val code{font-family:var(--mono);font-size:12.5px;color:var(--muted);
        flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1712,6 +1830,8 @@ INDEX_HTML = r"""<!doctype html>
       <button class="btn sm" id="copyDotenv">Copy <code>.env</code> cmd</button>
     </div>
 
+    <div class="tagbar" id="tagbar" hidden></div>
+
     <section class="table-wrap">
       <table class="tbl">
         <thead><tr><th>Name</th><th>Value</th><th class="ta-r">Actions</th></tr></thead>
@@ -1863,6 +1983,8 @@ INDEX_HTML = r"""<!doctype html>
     <label>Extra fields <span class="muted">(optional — one KEY=VALUE per line)</span></label>
     <textarea id="m_fields" placeholder="USERNAME=ops@acme.io&#10;URL=https://dash.stripe.com"
       autocomplete="off" spellcheck="false" style="min-height:54px"></textarea>
+    <label>Tags <span class="muted">(optional — space or comma separated)</span></label>
+    <input id="m_tags" placeholder="prod  db  payments" autocomplete="off" spellcheck="false">
     <div class="hint">Saving encrypts the vault for every member and (if it is a git repo)
       commits &amp; pushes automatically.</div>
     <div class="dialog-actions">
@@ -1937,6 +2059,8 @@ const ICON={
 };
 
 let SECRETS=[];        // full paths
+let TAGS={};           // full path -> [tag, ...]
+let activeTags=new Set(); // tag filter — a secret must carry ALL selected tags
 let MEMBERS=[];
 let current=null;      // selected folder, null = all
 let search="";
@@ -2080,10 +2204,14 @@ function render(){
     $('#copyEnv').onclick=()=>writeClip('envkeep env '+current,'Copied command','envkeep env '+current);
     $('#copyDotenv').onclick=()=>writeClip('envkeep env '+current+' --dotenv','Copied command','envkeep env '+current+' --dotenv');
   } else fb.hidden=true;
+  renderTagbar();
 
   let rows=SECRETS.slice();
   if(current!=null)rows=rows.filter(f=>folderOf(f)===current);
-  if(search)rows=rows.filter(f=>f.toLowerCase().includes(search));
+  if(activeTags.size)rows=rows.filter(f=>{
+    const t=new Set(TAGS[f]||[]);return [...activeTags].every(x=>t.has(x));});
+  if(search)rows=rows.filter(f=>
+    f.toLowerCase().includes(search)||(TAGS[f]||[]).some(t=>t.includes(search)));
   rows.sort();
   $('#viewCount').textContent=rows.length?(rows.length+(rows.length===1?' secret':' secrets')):'';
 
@@ -2102,6 +2230,15 @@ function render(){
     const tdName=el('td');
     tdName.appendChild(el('div','key',keyOf(full)));
     if(current==null&&folderOf(full))tdName.appendChild(el('span','tag',folderOf(full)));
+    const tgs=TAGS[full]||[];
+    if(tgs.length){
+      const box=el('div','ttags');
+      tgs.forEach(t=>{const c=el('span','ttag',t);
+        c.title='Filter by #'+t;
+        c.onclick=()=>{activeTags.has(t)?activeTags.delete(t):activeTags.add(t);render();};
+        box.appendChild(c);});
+      tdName.appendChild(box);
+    }
     tr.appendChild(tdName);
 
     const tdVal=el('td');
@@ -2147,6 +2284,30 @@ function render(){
   });
 }
 
+function renderTagbar(){
+  const bar=$('#tagbar');bar.innerHTML='';
+  // count tags across whatever the folder filter has already narrowed to
+  const scope=SECRETS.filter(f=>current==null||folderOf(f)===current);
+  const counts={};
+  scope.forEach(f=>(TAGS[f]||[]).forEach(t=>{counts[t]=(counts[t]||0)+1;}));
+  const all=Object.keys(counts).sort();
+  if(!all.length&&!activeTags.size){bar.hidden=true;return;}
+  bar.hidden=false;
+  bar.appendChild(el('span','tb-lbl','Tags'));
+  all.forEach(t=>{
+    const chip=el('button','chip'+(activeTags.has(t)?' on':''));
+    chip.appendChild(el('span',null,'#'+t));
+    chip.appendChild(el('span','ct',String(counts[t])));
+    chip.onclick=()=>{activeTags.has(t)?activeTags.delete(t):activeTags.add(t);render();};
+    bar.appendChild(chip);
+  });
+  if(activeTags.size){
+    const clr=el('button','tb-clear','Clear filter');
+    clr.onclick=()=>{activeTags.clear();render();};
+    bar.appendChild(clr);
+  }
+}
+
 // ---- modal (new + edit) ----
 let editing=null;   // full path when editing an existing secret, else null
 async function openModal(edit){
@@ -2154,8 +2315,8 @@ async function openModal(edit){
   const dl=$('#folderlist');dl.innerHTML='';
   Object.keys(folders()).filter(f=>f!=='').sort().forEach(f=>{
     const o=document.createElement('option');o.value=f;dl.appendChild(o);});
-  const fF=$('#m_folder'),fN=$('#m_name'),fV=$('#m_value'),fNo=$('#m_notes'),fFi=$('#m_fields');
-  fNo.value='';fFi.value='';
+  const fF=$('#m_folder'),fN=$('#m_name'),fV=$('#m_value'),fNo=$('#m_notes'),fFi=$('#m_fields'),fT=$('#m_tags');
+  fNo.value='';fFi.value='';fT.value='';
   if(editing){
     $('#modalTitle').textContent='Edit secret';
     $('#m_save').textContent='Update secret';
@@ -2164,7 +2325,8 @@ async function openModal(edit){
     fV.value='';fV.placeholder='Enter a new value...';
     $('#modal').hidden=false;
     try{const j=await apiReveal(editing);fV.value=j.value;
-      fNo.value=j.notes||'';fFi.value=fieldsToText(j.fields);}catch(e){}
+      fNo.value=j.notes||'';fFi.value=fieldsToText(j.fields);
+      fT.value=(j.tags||[]).join(' ');}catch(e){}
     setTimeout(()=>fV.focus(),30);
   } else {
     $('#modalTitle').textContent='New secret';
@@ -2187,8 +2349,9 @@ async function saveModal(){
   if(!n||v===''){toast('Name and value are required');return;}
   const full=editing?editing:(f?f+'/'+n:n);
   const notes=$('#m_notes').value;const fields=parseFields($('#m_fields').value);
+  const tags=$('#m_tags').value.split(/[\s,]+/).filter(Boolean);
   try{await api('/api/set',{method:'POST',
-      body:JSON.stringify({name:full,value:v,notes:notes,fields:fields})});
+      body:JSON.stringify({name:full,value:v,notes:notes,fields:fields,tags:tags})});
     const wasEditing=!!editing;closeModal();
     delete revealed[full];
     toast((wasEditing?'Updated ':'Saved ')+keyOf(full));await load();
@@ -2230,7 +2393,10 @@ async function lock(){
 
 async function load(){
   const j=await api('/api/list');
-  SECRETS=j.secrets;MEMBERS=j.members;TOUCHID=!!j.touchid;UNLOCK_MIN=j.unlock_minutes||15;
+  SECRETS=j.secrets;TAGS=j.tags||{};MEMBERS=j.members;TOUCHID=!!j.touchid;UNLOCK_MIN=j.unlock_minutes||15;
+  // drop any active filter whose tag no longer exists anywhere
+  const live=new Set(Object.values(TAGS).flat());
+  activeTags=new Set([...activeTags].filter(t=>live.has(t)));
   GATE_ON=!!(j.touchid||j.totp||j.key_protected);
   $('#memcount').innerHTML='<svg width="13" height="13" viewBox="0 0 24 24" fill="none" '
     +'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
@@ -2324,6 +2490,9 @@ function buildCommands(){
   Object.keys(folders()).filter(f=>f).sort().forEach(f=>
     c.push({k:'env',ic:'$',label:'Copy env cmd: '+f,sub:'envkeep env '+f,
       run:()=>writeClip('envkeep env '+f,'Copied command','envkeep env '+f)}));
+  [...new Set(Object.values(TAGS).flat())].sort().forEach(t=>
+    c.push({k:'tag',ic:'#',label:'Filter by tag: #'+t,
+      run:()=>{current=null;activeTags=new Set([t]);render();renderNav();}}));
   SECRETS.slice().sort().forEach(full=>{
     c.push({k:'cmd',ic:'>',label:'Copy command: '+full,sub:getCmd(full),
       run:()=>writeClip(getCmd(full),'Copied command for '+keyOf(full),getCmd(full))});
@@ -2515,6 +2684,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("list", help="list secret names (no values)")
     s.add_argument("prefix", nargs="?", help="only names under this folder/project")
+    s.add_argument("--tag", action="append", metavar="TAG",
+                   help="only secrets carrying this tag (repeat/comma-separate to require several)")
     s.set_defaults(func=cmd_list)
 
     s = sub.add_parser("folders", help="list folders/projects")
@@ -2554,6 +2725,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="KEY=VALUE to set, KEY to read, or omit to list field names")
     s.add_argument("--rm", action="store_true", help="remove the field named KEY")
     s.set_defaults(func=cmd_field)
+
+    s = sub.add_parser("tag", help="show/add/remove a secret's tags")
+    s.add_argument("name")
+    s.add_argument("tags", nargs="*", help="tags to add (omit to list; space- or comma-separated)")
+    s.add_argument("--rm", action="append", metavar="TAG", help="tag(s) to remove")
+    s.add_argument("--clear", action="store_true", help="remove every tag")
+    s.set_defaults(func=cmd_tag)
+
+    s = sub.add_parser("tags", help="list all tags in the vault, with counts")
+    s.set_defaults(func=cmd_tags)
 
     s = sub.add_parser("members", help="show who can read the vault")
     s.set_defaults(func=cmd_members)
